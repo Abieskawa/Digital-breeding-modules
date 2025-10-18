@@ -69,6 +69,7 @@ Usage: $0 -d <working_directory> -o <output_directory> -t <threads> -l <min_leng
           [-a1 <adapter_read1>] [-a2 <adapter_read2>]
 
 This script expects paired‐end files named as: <basename>_1.<ext> and <basename>_2.<ext>,
+or <basename>_R1.<ext> and <basename>_R2.<ext>,
 where <ext> can be one of: fastq, fq, fastq.gz, or fq.gz.
 
 Example (global front trimming):
@@ -253,107 +254,114 @@ shopt -s nullglob
 
 ############################################
 # Process each sample
+# (MINIMAL CHANGE: support *_1/*_2 and *_R1/*_R2; ignore fastqc html/zip)
 ############################################
-# This script expects paired‐end files named as: <basename>_1.<ext> and <basename>_2.<ext>,
-# where <ext> can be fastq, fq, fastq.gz, or fq.gz.
 found_samples=0
-for file in *_[1].fastq *_[1].fq *_[1].fastq.gz *_[1].fq.gz; do
-  if [ ! -f "$file" ]; then
-    continue
+
+for file in *_1.fastq *_1.fq *_1.fastq.gz *_1.fq.gz *_R1.fastq *_R1.fq *_R1.fastq.gz *_R1.fq.gz; do
+  [[ ! -f "$file" ]] && continue
+
+  # Match: <basename>_(1|R1).(fastq|fq)(.gz)?
+  if [[ "$file" =~ ^(.+)_((R)?1)\.(fastq|fq)(\.gz)?$ ]]; then
+    basename="${BASH_REMATCH[1]}"
+    r1tag="${BASH_REMATCH[2]}"              # "1" or "R1"
+    ext_core="${BASH_REMATCH[4]}"           # fastq or fq
+    ext_gz="${BASH_REMATCH[5]}"             # maybe ".gz"
+    ext="${ext_core}${ext_gz}"              # e.g., fastq.gz
+
+    # Build read1/read2 names depending on tag style
+    if [[ "$r1tag" == "R1" ]]; then
+      read1="${basename}_R1.${ext}"
+      read2="${basename}_R2.${ext}"
+      key_r1="${basename}_R1"
+      key_r2="${basename}_R2"
+      key_r1_alt="${basename}_1"
+      key_r2_alt="${basename}_2"
+    else
+      read1="${basename}_1.${ext}"
+      read2="${basename}_2.${ext}"
+      key_r1="${basename}_1"
+      key_r2="${basename}_2"
+      key_r1_alt="${basename}_R1"
+      key_r2_alt="${basename}_R2"
+    fi
+
+    # Require paired file
+    if [[ ! -f "$read1" || ! -f "$read2" ]]; then
+      echo "Skipping sample '${basename}': missing pair (${read1} / ${read2})."
+      continue
+    fi
+
+    found_samples=1
+    echo "Processing sample: ${basename}"
+
+    ############################################
+    # Determine front trim values (per-sample or global)
+    ############################################
+    sample_trim_r1=""
+    sample_trim_r2=""
+
+    if [[ -n "${per_sample_trim_R1[$key_r1]}" ]]; then
+      sample_trim_r1="${per_sample_trim_R1[$key_r1]}"
+    elif [[ -n "${per_sample_trim_R1[$key_r1_alt]}" ]]; then
+      sample_trim_r1="${per_sample_trim_R1[$key_r1_alt]}"
+    elif [[ -n "$global_trim_R1" ]]; then
+      sample_trim_r1="$global_trim_R1"
+    fi
+
+    if [[ -n "${per_sample_trim_R2[$key_r2]}" ]]; then
+      sample_trim_r2="${per_sample_trim_R2[$key_r2]}"
+    elif [[ -n "${per_sample_trim_R2[$key_r2_alt]}" ]]; then
+      sample_trim_r2="${per_sample_trim_R2[$key_r2_alt]}"
+    elif [[ -n "$global_trim_R2" ]]; then
+      sample_trim_r2="$global_trim_R2"
+    fi
+
+    ############################################
+    # Define adapter options for cutadapt
+    ############################################
+    adapter_fasta="$script_dir/adapter_list.txt"
+
+    if [[ -n "$adapter1" ]]; then
+      adapter_opts1=( -a "$adapter1" )
+    elif [[ -f "$adapter_fasta" ]]; then
+      adapter_opts1=( -a "file:$adapter_fasta" )
+    else
+      adapter_opts1=( -a "AGATCGGAAGAG" -a "AAAAAAAAAAAA" -a "GGGGGGGGGGGG" )
+    fi
+
+    if [[ -n "$adapter2" ]]; then
+      adapter_opts2=( -A "$adapter2" )
+    elif [[ -f "$adapter_fasta" ]]; then
+      adapter_opts2=( -A "file:$adapter_fasta" )
+    else
+      adapter_opts2=( -A "AGATCGGAAGAG" -A "AAAAAAAAAAAA" -A "GGGGGGGGGGGG" )
+    fi
+
+    ############################################
+    # Build the cutadapt command
+    ############################################
+    cmd=(cutadapt)
+    cmd+=( "${adapter_opts1[@]}" "${adapter_opts2[@]}" )
+    cmd+=( -j "$threads" -q "$quality1" -Q "$quality2" -m "$min_length" )
+
+    # Add front trim options if trim values were determined.
+    [[ -n "$sample_trim_r1" ]] && cmd+=( -u "$sample_trim_r1" )
+    [[ -n "$sample_trim_r2" ]] && cmd+=( -U "$sample_trim_r2" )
+
+    # Define output filenames (placed in the output directory)
+    out1="${output_dir}/${basename}_1.cleaned.${ext}"
+    out2="${output_dir}/${basename}_2.cleaned.${ext}"
+
+    cmd+=( -o "$out1" -p "$out2" "$read1" "$read2" )
+
+    echo "Running command: ${cmd[*]}"
+    "${cmd[@]}"
   fi
-  found_samples=1
-  
-  # Extract basename by removing the trailing _1 and extension.
-  basename="${file%_1.*}"
-  ext="${file##*_1.}"
-  
-  read1="${basename}_1.${ext}"
-  read2="${basename}_2.${ext}"
-  
-  if [[ ! -f "$read1" || ! -f "$read2" ]]; then
-    echo "Skipping sample '$basename': one or both paired-end files are missing."
-    continue
-  fi
-  
-  echo "Processing sample: $basename"
-  
-  ############################################
-  # Determine front trim values for each read.
-  # Support multiple naming conventions for lookup keys
-  ############################################
-  sample_key_r1="${basename}_1"
-  sample_key_r2="${basename}_2"
-  sample_key_r1_alt="${basename}_R1"
-  sample_key_r2_alt="${basename}_R2"
-  
-  sample_trim_r1=""
-  sample_trim_r2=""
-  
-  # Try to find trim values using different key formats
-  if [[ -n "${per_sample_trim_R1[$sample_key_r1]}" ]]; then
-    sample_trim_r1="${per_sample_trim_R1[$sample_key_r1]}"
-  elif [[ -n "${per_sample_trim_R1[$sample_key_r1_alt]}" ]]; then
-    sample_trim_r1="${per_sample_trim_R1[$sample_key_r1_alt]}"
-  elif [[ -n "$global_trim_R1" ]]; then
-    sample_trim_r1="$global_trim_R1"
-  fi
-  
-  if [[ -n "${per_sample_trim_R2[$sample_key_r2]}" ]]; then
-    sample_trim_r2="${per_sample_trim_R2[$sample_key_r2]}"
-  elif [[ -n "${per_sample_trim_R2[$sample_key_r2_alt]}" ]]; then
-    sample_trim_r2="${per_sample_trim_R2[$sample_key_r2_alt]}"
-  elif [[ -n "$global_trim_R2" ]]; then
-    sample_trim_r2="$global_trim_R2"
-  fi
-  
-  ############################################
-  # Define adapter options for cutadapt
-  ############################################
-  adapter_fasta="$script_dir/adapter_list.txt"
-  
-  if [[ -n "$adapter1" ]]; then
-    adapter_opts1=( -a "$adapter1" )
-  elif [[ -f "$adapter_fasta" ]]; then
-    adapter_opts1=( -a "file:$adapter_fasta" )
-  else
-    adapter_opts1=( -a "AGATCGGAAGAG" -a "AAAAAAAAAAAA" -a "GGGGGGGGGGGG" )
-  fi
-  
-  if [[ -n "$adapter2" ]]; then
-    adapter_opts2=( -A "$adapter2" )
-  elif [[ -f "$adapter_fasta" ]]; then
-    adapter_opts2=( -A "file:$adapter_fasta" )
-  else
-    adapter_opts2=( -A "AGATCGGAAGAG" -A "AAAAAAAAAAAA" -A "GGGGGGGGGGGG" )
-  fi
-  
-  ############################################
-  # Build the cutadapt command
-  ############################################
-  cmd=(cutadapt)
-  cmd+=( "${adapter_opts1[@]}" "${adapter_opts2[@]}" )
-  cmd+=( -j "$threads" -q "$quality1" -Q "$quality2" -m "$min_length" )
-  
-  # Add front trim options if trim values were determined.
-  if [[ -n "$sample_trim_r1" ]]; then
-    cmd+=( -u "$sample_trim_r1" )
-  fi
-  if [[ -n "$sample_trim_r2" ]]; then
-    cmd+=( -U "$sample_trim_r2" )
-  fi
-  
-  # Define output filenames (placed in the output directory)
-  out1="${output_dir}/${basename}_1.cleaned.${ext}"
-  out2="${output_dir}/${basename}_2.cleaned.${ext}"
-  
-  cmd+=( -o "$out1" -p "$out2" "$read1" "$read2" )
-  
-  echo "Running command: ${cmd[*]}"
-  "${cmd[@]}"
 done
 
 if [ $found_samples -eq 0 ]; then
-  echo "No input files matching supported extensions were found in $(pwd)"
+  echo "No input files matching *_1/*_R1 with fastq/fq(.gz) were found in $(pwd)"
 fi
 
 echo "All samples processed at $(date)"

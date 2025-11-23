@@ -1,0 +1,55 @@
+#General
+step=1-3 
+#step1:Preprocessing DNA-seq, step2: DNA-seq alignment, step 3: run deep variant
+#step0:do nothing in pipeline, allow users to adjust plot
+eva_step=0-3 
+#fastp has its own evaluation output, so there is no need to rerun it again
+output_dir=DGBreeding
+input_dir=test_DNA_seq
+ref_fasta=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.fna
+gff=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.gff
+population=Streptococcus_resistance_population #Just for Readgroup / Circos plot naming, you can type F2, diversity_panel, Population of Streptococcus resistance
+
+#Resources
+threads=96
+mem=8G
+GPU=no #Specify 'true' and use GPU mode if there is GPU in your local machine [developing]
+
+#fastp specific parameter
+fastp_quality=20
+fastp_length=5
+fastp_average_qual=20
+fastp_trim_front=10
+
+#alignment
+seq_platform=NovaSeq #Optical distance for Novaseq: 2500 Hiseq=100
+optical_distance=100 #Override optical distance used by samtools markdup (default falls back to HiSeq=100 when platform unknown)
+mark_duplicates=true #Set false to skip samtools markdup (pipeline will only sort and filter)
+#If you use a different sequencer, set seq_platform=other and provide optical_distance explicitly.
+skip_alignment_samples=  # optional: comma/semicolon-separated sample IDs to skip in alignment
+skip_variant_samples=    # optional: skip these samples in variant calling (defaults to alignment list if left blank)
+
+#Variant calling
+#ld_method=indep-pairwise or indep
+model_type=WGS
+# capture_bed=
+hwe_p=1e-5
+geno_missing=0.10
+ld_method=indep 
+ld_window=50
+ld_step=5
+ld_param=2.0
+gff_biotype=protein_coding
+circos_window=10000 #bp 
+# Optional: control circos tick spacing and per-track bin sizes
+circos_tick_step=10000000    # bp; set e.g., 10000000 for 10 Mb fixed tick spacing; if blank -> only 0 and end
+circos_gene_window=100000
+circos_var_window=100000
+# Number of longest chromosomes/contigs to plot in circos (e.g., 21 = top 21 by length)
+target_seq=21
+# Alternatively, restrict circos to specific chromosomes/contigs (comma-separated). Leave blank to plot all.
+# circos_chroms=chr1,chr2,chr3
+
+#Evaluation
+# Toggle labeling for boxplot outliers/medians (Kraken + mapping). Accepts true/false/0/1/no/off.
+tag_outliers=true

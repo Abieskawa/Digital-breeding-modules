@@ -18,9 +18,10 @@ class DNAAlignment:
         self.align_outdir = Path(args.align_outdir)
         self.align_outdir.mkdir(parents=True, exist_ok=True)
         self.align_log = self.align_outdir / "alignment.log"
-        self.align_log.touch(exist_ok=True)
+        self.align_log.touch(exist_ok=True) # Create the file it does not exist .
         self.seq_platform = args.seq_platform
         self.mark_duplicates = getattr(args, "mark_duplicates", True)
+        self.filter_proper_pairs = getattr(args, "filter_proper_pairs", True)
         # Allow explicit override; otherwise derive from platform with a safe default
         self.optical_distance = getattr(args, "optical_distance", None)
         if self.optical_distance is None:
@@ -115,16 +116,17 @@ class DNAAlignment:
                         self.optical_distance, self.threads, align_dir_str, base
                     )
                 )
-            cmd_parts.append(
-                "samtools view -b -f 2 -@ {0} -F 2048 -o {1}/{2}.bam".format(
-                    self.threads, align_dir_str, base
-                )
-            )
-            # build single-line pipeline to avoid mangling with clean_cmd
+            view_cmd = f"samtools view -b -@ {self.threads}"
+            if self.filter_proper_pairs:
+                view_cmd += " -f 2 -F 2048"
+            view_cmd += f" -o {align_dir_str}/{base}.bam"
+            cmd_parts.append(view_cmd)
+            # build single-line pipeline to avoid mangling whitespace
             cmd = " | ".join(cmd_parts)
             cmd = f"set -o pipefail; {cmd}"
             # fixmate: fills in mate coordinates and insert size fields.
             # it remove duplicate during the process
+            # When filter_proper_pairs is enabled:
             # -f 2:  require read mapped in proper pair (0x2)
             # -F 2048: remove supplementary alignment (0x800)
 

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from pycirclize import Circos
 
-from Utils.utils import call_log, clean_cmd, time_stamp
+from Utils.utils import call_log, time_stamp
 
 
 def _format_bp(x: int) -> str:
@@ -355,7 +355,7 @@ class VariantCircosEvaluator:
     @staticmethod
     def _bcftools_stats_one(vcf: Path, stats_out: Path) -> Optional[Dict]:
         stats_out.parent.mkdir(parents=True, exist_ok=True)
-        cmd = clean_cmd(f"bcftools stats -s - {vcf} > {stats_out}")
+        cmd = f"bcftools stats -s - {vcf} > {stats_out}"
         try:
             sbp.run(cmd, shell=True, check=True, stdout=sbp.DEVNULL, stderr=sbp.DEVNULL)
         except sbp.CalledProcessError:

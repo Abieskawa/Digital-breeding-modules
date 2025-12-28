@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearnex import patch_sklearn,unpatch_sklearn
 from sklearn import metrics, ensemble, svm
-from sklearn.model_selection import RepeatedStratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
@@ -22,31 +22,13 @@ from torchmetrics import ROC
 import argparse
 from qmplot import manhattanplot, qqplot  # Ensure you have qmplot installed
 from sklearn.preprocessing import StandardScaler
-from concurrent.futures import ProcessPoolExecutor,as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
+from Utils.utils import read_config
 import seaborn as sns
 from imblearn.over_sampling import SMOTE
 
 
-
-def read_config(config_file):
-    """
-    Read the configuration file and return a dictionary of configurations.
-    Handles inline comments by stripping them out.
-    """
-    config = {}
-    with open(config_file, 'r') as file:
-        for line in file:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                # Remove inline comments
-                if '#' in line:
-                    line = line.split('#', 1)[0].strip()
-                key_value = line.split('=', 1)
-                if len(key_value) == 2:
-                    key, value = key_value
-                    config[key.strip()] = value.strip()
-    return config
 
 def parallel_process(items: List[tuple], process_func, max_workers: int = 8):
     """
@@ -111,9 +93,23 @@ class SNPPredictionModelTool:
         self.data_type = self.config.get('data_type', 'regression')
         self.oversampling = self.config.get('oversampling', 'True').lower() == 'true'
 
-        # Get the working directory from the configuration file
-        self.output_dir = self.config.get('output_dir', 'results')
+        base_output_dir = self.config.get('output_dir', 'results')
+        prediction_output_dir = (self.config.get('prediction_output_dir') or '').strip()
+        if prediction_output_dir:
+            if os.path.isabs(prediction_output_dir):
+                self.output_dir = prediction_output_dir
+            else:
+                self.output_dir = os.path.join(base_output_dir, prediction_output_dir)
+        else:
+            self.output_dir = base_output_dir
         self.blink_bin = self.config.get('blink_bin', 'blink1_5')
+        blink_workers_raw = (self.config.get('blink_gwas_workers') or '').strip()
+        try:
+            self.blink_gwas_workers = int(blink_workers_raw) if blink_workers_raw else 1
+        except ValueError:
+            self.blink_gwas_workers = 1
+        if self.blink_gwas_workers < 1:
+            self.blink_gwas_workers = 1
         # Ensure the working directory exists
         os.makedirs(self.output_dir, exist_ok=True)
         
@@ -126,7 +122,11 @@ class SNPPredictionModelTool:
         self.top_n_snps_list = [int(x) for x in self.config.get('top_n_snps_list', '10').split(',')]
         self.models = self.config.get('models', 'SVM,RandomForest,XGBoost').split(',')
         self.num_shuffles = int(self.config.get('num_shuffles', '10'))
-        self.num_threads = int(self.config.get('num_threads', '4'))
+        threads_raw = (self.config.get('num_threads') or self.config.get('threads') or '4').strip()
+        try:
+            self.num_threads = int(threads_raw)
+        except ValueError:
+            self.num_threads = 4
         self.num_splits = int(self.config.get('num_splits', '5'))
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
@@ -313,7 +313,7 @@ class SNPPredictionModelTool:
             principal_file = os.path.join(current_dir, f'train_{file_fold_npc_index}.cov')
             filtered_principal_df.to_csv(principal_file, sep='\t', index=False)
             # Save explained variance ratios for scree plot
-    
+
     def run_gwas(self, file_fold_npc_index):
         """
         Run GWAS analysis using BLINK.
@@ -681,7 +681,7 @@ class SNPPredictionModelTool:
             # Extract metadata from the file names
             meta = prob_file.split('_')
             model_name = meta[1]
-            fold = next((frag.replace('Fold', '') for frag in meta if '-' in frag), None)
+            fold = next((frag.replace('Fold', '') for frag in meta if frag.startswith('Fold')), None)
             n_pcs = int(next((frag.replace('PC', '') for frag in meta if 'PC' in frag), None))
             n_snps = int(next((frag.replace('SNPs.npy', '') for frag in meta if 'SNPs.npy' in frag), None))
 
@@ -803,9 +803,9 @@ class SNPPredictionModelTool:
         auc_df.to_csv(summary_csv, index=False)
         print(f'Summary CSV saved: {summary_csv}')
 
-    def pca_plotter(self, repeat_index, pca_df_shuffle):
+    def pca_plotter(self, pca_df_by_fold):
         """
-        Plot the first three principal components from the PCA results for a specific shuffle.
+        Plot the first three principal components from the PCA results across folds.
         """
         # Set markers for the groups
         markers = ['o', 's', '^', 'D', 'v', '*', '+', 'x']  # Extend markers if needed
@@ -819,7 +819,7 @@ class SNPPredictionModelTool:
         # Define colors for each group
         unique_groups = None  # Will be determined based on phenotype data
 
-        for fold_index, df in pca_df_shuffle.items():
+        for fold_index, df in pca_df_by_fold.items():
             # Read phenotype data to get group labels
             phenotype_df = pd.read_csv(self.phenotype_csv_path, sep=None, engine='python')
             phenotype_df = phenotype_df[['taxa', self.phenotype_column]]
@@ -865,30 +865,29 @@ class SNPPredictionModelTool:
 
         # Save the plot
         plt.tight_layout()
-        plot_path = os.path.join(self.pca_scree_output_dir, f'pca_plots_Fold_{repeat_index}_{self.phenotype_column}_{self.species_name}.png')
+        plot_path = os.path.join(self.pca_scree_output_dir, f'pca_plots_folds_{self.phenotype_column}_{self.species_name}.png')
         plt.savefig(plot_path)
         plt.close()
     
-    def combined_scree_plot(self, repeat_index, explained_variances_shuffle):
+    def combined_scree_plot(self, explained_variances_by_fold):
         """
-        Plot the scree plot of explained variance for the first 15 principal components for a specific shuffle.
+        Plot the scree plot of explained variance for the first 15 principal components across folds.
     
         Parameters:
-        - repeat_index (int): Index of the current shuffle.
-        - explained_variances_shuffle (dict): Dictionary where keys are fold indices and values are explained variance ratios.
+        - explained_variances_by_fold (dict): Dictionary where keys are fold indices and values are explained variance ratios.
         """
         # Create a figure for the scree plot
         fig, ax = plt.subplots(figsize=(8, 6))
 
         # Define colors for each fold
-        num_folds = len(explained_variances_shuffle.keys())
+        num_folds = len(explained_variances_by_fold.keys())
         colors = plt.cm.rainbow(np.linspace(0, 1, num_folds))
 
         # Map fold indices to sequential indices
-        fold_index_map = {fold: idx for idx, fold in enumerate(explained_variances_shuffle.keys())}
+        fold_index_map = {fold: idx for idx, fold in enumerate(explained_variances_by_fold.keys())}
 
         # Loop through the dictionary
-        for fold_index, explained_variance_ratio in explained_variances_shuffle.items():
+        for fold_index, explained_variance_ratio in explained_variances_by_fold.items():
             # Map fold_index to sequential color index
             color_index = fold_index_map[fold_index]
 
@@ -901,7 +900,7 @@ class SNPPredictionModelTool:
 
         # Adding titles and labels
         ax.set_xticks(range(1, 16))
-        ax.set_title(f'Scree Plot of Explained Variance for PCA - Fold {repeat_index} of {self.phenotype_column} in {self.species_name}', fontsize=16)
+        ax.set_title(f'Scree Plot of Explained Variance for PCA - {self.phenotype_column} in {self.species_name}', fontsize=16)
         ax.set_xlabel('Principal Components', fontsize=14)
         ax.set_ylabel('Cumulative Explained Variance Ratio (%)', fontsize=14)
 
@@ -911,7 +910,7 @@ class SNPPredictionModelTool:
         plt.tight_layout()
 
         # Save the plot to a file
-        plot_path = os.path.join(self.pca_scree_output_dir, f'scree_plot_shuffle_{repeat_index}.png')
+        plot_path = os.path.join(self.pca_scree_output_dir, f'scree_plot_folds_{self.phenotype_column}_{self.species_name}.png')
         plt.savefig(plot_path)
         plt.close()
     
@@ -968,11 +967,17 @@ class SNPPredictionModelTool:
 
 def run_snp_prediction_model():
     """
-    Run SNP Prediction Model with runs of cross-validation, n_snps, n_pcs, models.
+    Run SNP Prediction Model with x-fold cross-validation, n_snps, n_pcs, models.
     """
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="SNP Prediction Model")
     parser.add_argument("config_file", help="Path to the configuration file")
+    parser.add_argument(
+        "--stage",
+        choices=["all", "gwas", "model"],
+        default="all",
+        help="Run BLINK GWAS/PCA, model construction, or both.",
+    )
     args = parser.parse_args()
     print("Path to config file:", args.config_file)
 
@@ -982,74 +987,92 @@ def run_snp_prediction_model():
     # Initialize the model with the configuration
     Tools = SNPPredictionModelTool(config)
 
+    stage = args.stage.lower()
+    run_gwas = stage in {"all", "gwas"}
+    run_model = stage in {"all", "model"}
+
     # Extract parameters
     eva_file_path = os.path.join(Tools.output_dir, 'model_evaluation_results_mean.csv')
 
-    if not os.path.isfile(eva_file_path):
-        models = Tools.models
+    if os.path.isfile(eva_file_path) and stage in {"all", "model"}:
+        print("Evaluation results already exist. Run the ROC evaluation script to plot performance.")
+        print("Finsihed")
+        return
 
-        # Initialize intersect_snps list
-        snps_list = []
+    models = Tools.models if run_model else []
 
-        # Load data
-        genotype_df = Tools.vcf_to_dataframe(Tools.vcf_file_path)
-        phenotype_df = pd.read_csv(Tools.phenotype_csv_path)
-        phenotype_df.set_index('taxa', inplace=True)
-        y = phenotype_df.loc[genotype_df.index, Tools.phenotype_column].values
+    # Load data
+    genotype_df = Tools.vcf_to_dataframe(Tools.vcf_file_path)
+    phenotype_df = pd.read_csv(Tools.phenotype_csv_path)
+    phenotype_df.set_index('taxa', inplace=True)
+    y = phenotype_df.loc[genotype_df.index, Tools.phenotype_column].values
 
-        # Initialize RepeatedStratifiedKFold
-        rskf = RepeatedStratifiedKFold(n_splits=Tools.num_splits, n_repeats=Tools.num_shuffles, random_state=2024)
+    # Initialize StratifiedKFold for standard x-fold cross-validation
+    skf = StratifiedKFold(n_splits=Tools.num_splits, shuffle=True, random_state=2024)
+    splits = list(skf.split(genotype_df, y))
+    explained_variances_by_fold = {}
+    pca_df_by_fold = {}
 
-        # Initialize variables to manage repeats
-        fold_counter = 0
-        repeat_counter = 1
-        explained_variances_shuffle = {}
-        pca_df_shuffle = {}
-        models_list = []
-        plot_args_list = []
-
-        for train_index, test_index in rskf.split(genotype_df, y):
-            fold_counter += 1
-            if fold_counter > Tools.num_splits:
-                repeat_counter += 1
-                fold_counter = 1
-            # Calculate current repeat and fold indices
-            repeat_index = repeat_counter 
-            fold_index = fold_counter
-            
-            
-            print(f"Repeat {repeat_index}/{Tools.num_shuffles}: Starting cross-validation...")
-            print(f"Repeat {repeat_index}/{Tools.num_shuffles}, Fold {fold_index}/{Tools.num_splits}: Processing...")
-            # Parition the file as train and test
+    if run_gwas:
+        gwas_futures = []
+        executor = None
+        if Tools.blink_gwas_workers > 1:
+            executor = ThreadPoolExecutor(max_workers=Tools.blink_gwas_workers)
+            print(f"Running BLINK in parallel with {Tools.blink_gwas_workers} workers")
+        for fold_index, (train_index, _) in enumerate(splits, start=1):
+            print(f"Fold {fold_index}/{Tools.num_splits}: Preparing GWAS inputs...")
             train_genotype = genotype_df.iloc[train_index]
-            test_genotype = genotype_df.iloc[test_index]
-
-            if len(Tools.n_pcs_list) > 0 and fold_index == Tools.num_splits:
-                Tools.pca_plotter(repeat_index, pca_df_shuffle)
-                Tools.combined_scree_plot(repeat_index, explained_variances_shuffle)
-            
             train_genotype_numeric = Tools.convert_genotypes_to_numeric(train_genotype)
+            principal_df = None
+
             if Tools.use_pcs and len(Tools.n_pcs_list) > 0:
-                principal_df, explained_variance_ratio = Tools.perform_pca(train_genotype_numeric,fold_index,n_components=max(len(Tools.n_pcs_list), 15))
-                explained_variances_shuffle[fold_index] = explained_variance_ratio
-                pca_df_shuffle[fold_index] = principal_df
-            
-            # Check if we have moved to a new repeat
-            file_fold_index = f"{repeat_index}-{fold_index}"
-            #print(train_genotype_numeric)
+                principal_df, explained_variance_ratio = Tools.perform_pca(
+                    train_genotype_numeric,
+                    fold_index,
+                    n_components=max(len(Tools.n_pcs_list), 15),
+                )
+                explained_variances_by_fold[fold_index] = explained_variance_ratio
+                pca_df_by_fold[fold_index] = principal_df
+
+            file_fold_index = f"{fold_index}"
             for pc in Tools.n_pcs_list:
                 print(f"Include {pc} PCs as covariant")
                 file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
                 Tools.blink_file_generator(train_genotype_numeric, file_fold_npc_index, principal_df, pc)
-                # Run GWAS and select top SNPs
-                Tools.run_gwas(file_fold_npc_index)
-                plot_args_list.append(file_fold_npc_index)
+                if executor:
+                    gwas_futures.append(executor.submit(Tools.run_gwas, file_fold_npc_index))
+                else:
+                    Tools.run_gwas(file_fold_npc_index)
+
+        if executor:
+            for future in as_completed(gwas_futures):
+                future.result()
+            executor.shutdown()
+
+        if Tools.use_pcs and len(Tools.n_pcs_list) > 0 and pca_df_by_fold:
+            Tools.pca_plotter(pca_df_by_fold)
+            Tools.combined_scree_plot(explained_variances_by_fold)
+
+    models_list = []
+    snps_list = []
+    if run_model:
+        for fold_index, (train_index, test_index) in enumerate(splits, start=1):
+            print(f"Fold {fold_index}/{Tools.num_splits}: Preparing model data...")
+            train_genotype = genotype_df.iloc[train_index]
+            test_genotype = genotype_df.iloc[test_index]
+            file_fold_index = f"{fold_index}"
+            for pc in Tools.n_pcs_list:
+                file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
                 for n_snp in Tools.top_n_snps_list:
                     file_fold_npc_nsnp_index = f"{file_fold_npc_index}_{n_snp}SNPs"
                     current_dir = os.path.join(Tools.model_output_dir, file_fold_npc_nsnp_index)
                     os.makedirs(current_dir, exist_ok=True)
-                    selected_snps = Tools.select_markers_and_prepare_data_for_model_construction(file_fold_npc_index, file_fold_npc_nsnp_index, 
-                                                                             test_genotype, top_n_snps=n_snp)
+                    selected_snps = Tools.select_markers_and_prepare_data_for_model_construction(
+                        file_fold_npc_index,
+                        file_fold_npc_nsnp_index,
+                        test_genotype,
+                        top_n_snps=n_snp,
+                    )
                     snps_list.append([file_fold_index, pc, n_snp, selected_snps])
                     # Prepare features
                     train_csv_path = os.path.join(current_dir, f'train_selected_snps_{file_fold_npc_nsnp_index}.csv')
@@ -1070,18 +1093,13 @@ def run_snp_prediction_model():
                     if Tools.oversampling:
                         smt = SMOTE()
                         train_X, train_y = smt.fit_resample(train_X, train_y)
-                    
+
                     for model_name in models:
                         models_list.append(
                             (model_name, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list)
                         )
-        
-        # Parallelize the plotting process of Manhattan plot/QQ plot
-        parallel_process(
-                plot_args_list,
-                Tools.plot_manhattan_and_qq,
-                max_workers=Tools.num_threads
-        )
+    
+    if run_model and models_list:
         # Parallelize the machine learning process in parallel
         parallel_process(
                 models_list,
@@ -1089,10 +1107,9 @@ def run_snp_prediction_model():
                 max_workers=Tools.num_threads
         )
 
+    if run_model:
         # Concatenate results
         Tools.cat_result()
-        # ROC plot
-        Tools.plot_performance_comparison()
         # Collect SNPs from all folds
         snps_list_columns = ['file_fold_index', 'pc', 'n_snp', 'selected_snps']
         snps_list_df = pd.DataFrame(snps_list, columns=snps_list_columns)
@@ -1100,12 +1117,8 @@ def run_snp_prediction_model():
         # Identify SNPs that appear more than once
         snps_list_file = os.path.join(Tools.output_dir, f'snps_list.txt')
         snps_list_df.to_csv(snps_list_file, index=False)
-        
-        print("Finsihed")
-    else:
-        # ROC plot
-        Tools.plot_performance_comparison()
-        print("Finsihed")  
+
+    print("Finsihed")
   
 if __name__ == "__main__":
     run_snp_prediction_model()

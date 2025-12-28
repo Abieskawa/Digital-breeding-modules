@@ -1,46 +1,63 @@
-#General
-step=1-3 
-#step1:Preprocessing DNA-seq, step2: DNA-seq alignment, step 3: run deep variant
-#step0:do nothing in pipeline, allow users to adjust plot
-eva_step=0-3 
-#fastp has its own evaluation output, so there is no need to rerun it again
+# General
+# step1: Preprocessing DNA-seq, step2: DNA-seq alignment, step3: run deep variant, step4: BLINK GWAS/PCA, step5: SNP prediction model
+# step0: do nothing in pipeline; allow users to adjust evaluation step
+step=1-3
+eva_step=0-3
 output_dir=DGBreeding
-input_dir=test_DNA_seq
+input_dir=DNA_seq
 ref_fasta=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.fna
 gff=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.gff
-population=Streptococcus_resistance_population #Just for Readgroup / Circos plot naming, you can type F2, diversity_panel, Population of Streptococcus resistance
+population=Streptococcus_resistance_population # For Readgroup/Circos naming (e.g., F2, diversity_panel)
 
-#Resources
-threads=96
+# Resources
+threads=92
 mem=8G
-GPU=no #Specify 'true' and use GPU mode if there is GPU in your local machine [developing]
 
-#fastp specific parameter
+# Step 1: Preprocessing DNA-seq (fastp)
 fastp_quality=20
-fastp_length=5
+fastp_length=30
 fastp_average_qual=20
 fastp_trim_front=10
 
-#alignment
-seq_platform=NovaSeq #Optical distance for Novaseq: 2500 Hiseq=100
-optical_distance=100 #Override optical distance used by samtools markdup (default falls back to HiSeq=100 when platform unknown)
-mark_duplicates=true #Set false to skip samtools markdup (pipeline will only sort and filter)
-#If you use a different sequencer, set seq_platform=other and provide optical_distance explicitly.
+# Step 2: DNA-seq alignment
+seq_platform=Hiseq # Optical distance for Novaseq: 2500; HiSeq=100
+optical_distance=100 # Override optical distance used by samtools markdup (defaults to HiSeq=100 when platform unknown)
+mark_duplicates=true # Set false to skip samtools markdup (pipeline will only sort and filter)
+filter_proper_pairs=false # If true, apply samtools view -f 2 -F 2048; set false to keep all alignments
+# If you use a different sequencer, set seq_platform=other and provide optical_distance explicitly.
 skip_alignment_samples=  # optional: comma/semicolon-separated sample IDs to skip in alignment
 skip_variant_samples=    # optional: skip these samples in variant calling (defaults to alignment list if left blank)
 
-#Variant calling
-#ld_method=indep-pairwise or indep
+# Step 3: Variant calling
 model_type=WGS
-# capture_bed=
+# capture_bed=        # Optional: path to a pre-built capture BED (leave blank when auto-generating)
+# Optional: auto-generate capture BED for GLnexus
+generate_bed=true
+# Choose one scenario (mutually exclusive):
+# A) Gene-only contigs: bed_require_genes=true AND leave bed_top_n/bed_chroms blank
+# B) Top-N + explicit chroms: bed_require_genes=false AND set bed_top_n/bed_chroms
+# bed_top_n=21
+# bed_chroms=NC_013663.1  # NCBI mitochondrial sequence ID (example)
+bed_require_genes=true   # set true for gene-only (requires gff=...)
+# bed_gene_biotype=        # optional; leave blank to keep any gene biotype
+# bed_output=              # optional; default: 02_Variant_Calling/glnexus.capture.bed
+
+# PLINK quality filtration
 hwe_p=1e-5
 geno_missing=0.10
-ld_method=indep 
+
+# LD pruning (set ld_prune=true to enable)
+ld_prune=false
+# ld_method=indep-pairwise or indep
+# LD-pruning parameters (used only when ld_prune=true)
+ld_method=indep
 ld_window=50
 ld_step=5
 ld_param=2.0
+
+## Circos parameters
 gff_biotype=protein_coding
-circos_window=10000 #bp 
+circos_window=10000 #bp
 # Optional: control circos tick spacing and per-track bin sizes
 circos_tick_step=10000000    # bp; set e.g., 10000000 for 10 Mb fixed tick spacing; if blank -> only 0 and end
 circos_gene_window=100000
@@ -50,6 +67,42 @@ target_seq=21
 # Alternatively, restrict circos to specific chromosomes/contigs (comma-separated). Leave blank to plot all.
 # circos_chroms=chr1,chr2,chr3
 
-#Evaluation
+# Model construction:
+num_splits=10  # x-fold cross-validation
+
+# Step 4: BLINK GWAS / PCA
+# BLINK (GWAS)
+# blink_bin=blink_linux         # BLINK binary name/path
+blink_gwas_workers=1           # >1 to run multiple BLINK jobs in parallel
+
+# PCA settings
+use_pcs=True  # Set to False if you don't want to use PCs
+n_pcs_list=0,1  # List of PCs to test, separated by commas #max:15
+
+# Step 5: SNP prediction model
+phenotype_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/pheno.csv
+#pheno.csv #AtPolyDB/pheno.csv
+vcf_file_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/filtered_tilapia_60_model_974729.vcf
+#tilapia_60_model.vcf #AtPolyDB/genotype_recode_filtered.vcf
+chromosome_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/chromsome_recode.csv
+#chromsome_recode.csv #AtPolyDB/chromsome_recode.csv
+prediction_output_dir=prediction
+# If blank, prediction model uses output_dir; relative paths are under output_dir
+prediction_python= # Optional: override python path for step 5 (e.g., /opt/conda/envs/DGbreeding-ml/bin/python)
+
+# Phenotype column in your phenotype CSV
+species_name=Oreochromis_niloticus # Name of target species for name/title tag
+phenotype_column=Group  # Or any other phenotype column you are using #Chlorosis_10
+data_type=binary # binary, multiclass, regression
+oversampling=True # Over sampling with SMOTE if data is unbalanced
+
+
+# Top N SNPs settings
+top_n_snps_list=10,50  # List of top N SNPs to test, separated by commas
+
+# Models to evaluate
+models=MLP,SVM,RandomForest,XGBoost  # List of models to test, separated by commas #Avalable model: MLP,SVM,RandomForest,XGBoost
+
+# Evaluation
 # Toggle labeling for boxplot outliers/medians (Kraken + mapping). Accepts true/false/0/1/no/off.
-tag_outliers=true
+tag_outliers=false

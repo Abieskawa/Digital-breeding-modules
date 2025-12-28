@@ -108,7 +108,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("-d", "--wd", required=True, help="Working directory containing input FASTQs")
     p.add_argument("-o", "--outdir", required=True, help="Output directory (must exist)")
     p.add_argument("-w", "--threads", type=int, default=16, help="Threads for fastp (default: 16)")
-    p.add_argument("-l", "--min-length", type=int, default=15, help="--length_required (default: 15)")
+    p.add_argument("-l", "--min-length", type=int, default=30, help="--length_required (default: 30)")
     p.add_argument("-q", "--qualified-phred", type=int, default=20, help="Qualified base threshold Q (default: 20)")
     p.add_argument("-e", "--average-qual", type=int, default=0, help="Drop reads with avg qual < this (0=off)")
     p.add_argument("--lib-type", choices=["DNA", "RNA"], default="DNA", help="Library type tunes defaults. If RNA, enables --trim_poly_x (default: DNA)")

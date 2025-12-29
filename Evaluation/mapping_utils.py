@@ -206,11 +206,10 @@ def _kreport_total_reads(kreport: Path) -> Optional[int]:
     return None
 
 
-def _annotate_box_fliers(ax, x_values: Iterable, y_values: Iterable, labels: Iterable, rotation: int = 45, auto_adjust: bool = False) -> None:
+def _annotate_box_fliers(ax, x_values: Iterable, y_values: Iterable, labels: Iterable, rotation: int = 45) -> None:
     """
     Label boxplot fliers on the given axes.
     x_values / y_values / labels must be aligned and of equal length.
-    If auto_adjust is True and adjustText is available, labels are nudged to reduce overlap.
     """
     x_arr = np.asarray(list(x_values))
     y_arr = np.asarray(list(y_values), dtype=float)
@@ -236,7 +235,7 @@ def _annotate_box_fliers(ax, x_values: Iterable, y_values: Iterable, labels: Ite
             if yv in fliers_set:
                 texts.append(ax.text(xv, yv, lab, rotation=rotation, ha="right", va="center", fontsize=7))
 
-    if auto_adjust and texts:
+    if texts:
         try:
             adjust_text(
                 texts,

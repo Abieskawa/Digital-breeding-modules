@@ -19,7 +19,6 @@ fastp_length=30
 fastp_average_qual=20
 fastp_trim_front=10
 fastp_threads=64  # Optional: override fastp threads (fastp supports up to 64)
-fastp_dedup=false # Optional: enable fastp duplicate removal (off by default)
 
 # Step 2: DNA-seq alignment
 seq_platform=Hiseq # Optical distance for Novaseq: 2500; HiSeq=100
@@ -107,4 +106,5 @@ models=MLP,SVM,RandomForest,XGBoost  # List of models to test, separated by comm
 
 # Evaluation
 # Toggle labeling for boxplot outliers/medians (Kraken + mapping). Accepts true/false/0/1/no/off.
+kraken_db=/data/kraken2_db
 tag_outliers=false

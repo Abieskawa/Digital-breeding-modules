@@ -89,7 +89,6 @@ class MappingYieldEvaluator(MappingEvalBase):
                     x_values=plot_df["metric_label"].map(x_map),
                     y_values=plot_df["pct"],
                     labels=plot_df["sample"],
-                    auto_adjust=True,
                 )
 
             medians = plot_df.groupby("metric_label")["pct"].median()

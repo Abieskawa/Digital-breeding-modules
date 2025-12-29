@@ -111,6 +111,7 @@ class PredictionPipeline(object):
 
         # Paths
         self.outdir = Path(configure.get("output_dir","DGBreeding")).resolve()
+        self.outdir.mkdir(parents=True, exist_ok=True)
         self.input_dir = Path(configure.get("input_dir",".")).resolve()
         if not self.input_dir.exists():
             raise FileNotFoundError(f"input_dir not found: {self.input_dir}")
@@ -140,7 +141,6 @@ class PredictionPipeline(object):
         self.fastp_minlength = _coerce_int("fastp_length", configure.get("fastp_length", ""), 30)
         self.fastp_average_qual = _coerce_int("fastp_average_qual", configure.get("fastp_average_qual", "20"), 20)
         self.fastp_trim_front = configure.get("fastp_trim_front", "10")
-        self.fastp_dedup = _coerce_bool(configure.get("fastp_dedup", ""), False)
         self.fastp_outdir = self.outdir / "00_Preprocessed_DNA"
         self.fastp_report_dir = self.fastp_outdir / "fastp_reports"
         self.fastp_outdir.mkdir(parents=True, exist_ok=True)
@@ -305,7 +305,7 @@ class PredictionPipeline(object):
                 lib_type="DNA",
                 trim_front=self.fastp_trim_front,
                 detect_adapter_pe=True,
-                dedup=self.fastp_dedup,
+                dedup=True,
                 report_dir=self.fastp_report_dir,
             )
             time_stamp("Finished preprocessing with fastp")

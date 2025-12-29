@@ -134,7 +134,7 @@ class ContaminationEvaluator(MappingEvalBase):
         y_values = plot_top["name_freq_pct"]
         labels = plot_top["sample"]
         if self.tag_outliers:
-            _annotate_box_fliers(ax, x_values, y_values, labels, rotation=90, auto_adjust=True)
+            _annotate_box_fliers(ax, x_values, y_values, labels, rotation=90)
 
         medians = plot_top.groupby("name")["name_freq_pct"].median()
         for i, name in enumerate(top5_names):

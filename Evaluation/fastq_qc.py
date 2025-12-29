@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import subprocess as sbp
+import sys
 from pathlib import Path
 from typing import List
 
@@ -23,10 +24,19 @@ class FastQCEvaluator(MappingEvalBase):
           - 'raw': only consider the original input directory
           - 'processed': only consider fastp-cleaned outputs
         """
-        stage = (fastq_stage or "processed").strip().lower()
+        if fastq_stage is None:
+            time_stamp("[qc] fastq_stage is required; expected one of: raw, processed")
+            sys.exit(1)
+        stage = str(fastq_stage).strip().lower()
+        if not stage:
+            time_stamp("[qc] fastq_stage is blank; expected one of: raw, processed")
+            sys.exit(1)
         choices = {"raw", "processed"}
         if stage not in choices:
-            stage = "processed"
+            time_stamp(
+                f"[qc] invalid fastq_stage '{stage}'; expected one of: {', '.join(sorted(choices))}"
+            )
+            sys.exit(1)
 
         stage_dirs = []
         if stage == "processed":

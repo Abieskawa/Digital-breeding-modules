@@ -101,26 +101,21 @@ class VariantCalling:
         g_out   = self.variant_outdir / '{0}.g.vcf.gz'.format(sample)
         regions_arg = f"--regions={self.capture_bed}" if self.capture_bed else ""
 
-        cmd = '/opt/deepvariant/bin/run_deepvariant \
-               --model_type={4} \
-               --ref={5} \
-               --reads={1}/{6} \
-               {10} \
-               --output_vcf={2}/{7} \
-               --output_gvcf={2}/{8} \
-               --num_shards={9}'.format(
-                   ref_dir,                # {0}
-                   bam_dir,                # {1}
-                   self.variant_outdir,    # {2}
-                   self.deepvariant_image, # {3}
-                   self.model_type,        # {4}
-                   self.ref_fasta,    # {5}
-                   bam_path.name,          # {6}
-                   v_out.name,             # {7}
-                   g_out.name,             # {8}
-                   self.threads,           # {9}
-                   regions_arg             # {10}
-               )
+        jemalloc_path = Path("/usr/lib/x86_64-linux-gnu/libjemalloc.so.2")
+        deepvariant_bin = "/opt/deepvariant/bin/run_deepvariant"
+        if jemalloc_path.exists():
+            deepvariant_bin = f"LD_PRELOAD={jemalloc_path} {deepvariant_bin}"
+
+        cmd = (
+            f"{deepvariant_bin} "
+            f"--model_type={self.model_type} "
+            f"--ref={self.ref_fasta} "
+            f"--reads={bam_dir}/{bam_path.name} "
+            f"{regions_arg} "
+            f"--output_vcf={self.variant_outdir}/{v_out.name} "
+            f"--output_gvcf={self.variant_outdir}/{g_out.name} "
+            f"--num_shards={self.threads}"
+        )
         run_quiet(cmd, step='deepvariant', logdir=self.variant_outdir)
 
         # index outputs with host tabix

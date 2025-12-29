@@ -135,10 +135,12 @@ class PredictionPipeline(object):
         self.mem = configure.get("mem","8G")
 
         # fastp
+        self.fastp_threads = _coerce_int("fastp_threads", configure.get("fastp_threads", ""), self.threads)
         self.fastp_quality = _coerce_int("fastp_quality", configure.get("fastp_quality", ""), 20)
         self.fastp_minlength = _coerce_int("fastp_length", configure.get("fastp_length", ""), 30)
         self.fastp_average_qual = _coerce_int("fastp_average_qual", configure.get("fastp_average_qual", "20"), 20)
         self.fastp_trim_front = configure.get("fastp_trim_front", "10")
+        self.fastp_dedup = _coerce_bool(configure.get("fastp_dedup", ""), False)
         self.fastp_outdir = self.outdir / "00_Preprocessed_DNA"
         self.fastp_report_dir = self.fastp_outdir / "fastp_reports"
         self.fastp_outdir.mkdir(parents=True, exist_ok=True)
@@ -296,14 +298,14 @@ class PredictionPipeline(object):
             fastp_preprocessing.run_fastp(
                 wd=self.input_dir,
                 outdir=self.fastp_outdir,
-                threads=self.threads,
+                threads=self.fastp_threads,
                 min_length=self.fastp_minlength,
                 qualified_phred=self.fastp_quality,
                 average_qual=self.fastp_average_qual,
                 lib_type="DNA",
                 trim_front=self.fastp_trim_front,
                 detect_adapter_pe=True,
-                dedup=True,
+                dedup=self.fastp_dedup,
                 report_dir=self.fastp_report_dir,
             )
             time_stamp("Finished preprocessing with fastp")

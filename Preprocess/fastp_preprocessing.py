@@ -33,6 +33,7 @@ R1_PATTERNS = [
     "*_1.fastq", "*_1.fq", "*_1.fastq.gz", "*_1.fq.gz",
     "*_R1.fastq", "*_R1.fq", "*_R1.fastq.gz", "*_R1.fq.gz"
 ]
+FASTP_MAX_THREADS = 64
 
 def load_trim_file(trim_file: str) -> Tuple[Dict[str, int], Dict[str, int]]:
     """
@@ -107,7 +108,13 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("-d", "--wd", required=True, help="Working directory containing input FASTQs")
     p.add_argument("-o", "--outdir", required=True, help="Output directory (must exist)")
-    p.add_argument("-w", "--threads", type=int, default=16, help="Threads for fastp (default: 16)")
+    p.add_argument(
+        "-w",
+        "--threads",
+        type=int,
+        default=16,
+        help="Threads for fastp (default: 16, max: 64)"
+    )
     p.add_argument("-l", "--min-length", type=int, default=30, help="--length_required (default: 30)")
     p.add_argument("-q", "--qualified-phred", type=int, default=20, help="Qualified base threshold Q (default: 20)")
     p.add_argument("-e", "--average-qual", type=int, default=0, help="Drop reads with avg qual < this (0=off)")
@@ -143,6 +150,16 @@ def run_fastp(
         outdir.mkdir(parents=True, exist_ok=True)
     if report_dir and not report_dir.exists():
         raise FileNotFoundError(f"Report dir not found: {report_dir}")
+
+    if threads < 1:
+        print(f"[warn] fastp threads must be >= 1; using 1 (requested {threads})", file=sys.stderr)
+        threads = 1
+    elif threads > FASTP_MAX_THREADS:
+        print(
+            f"[warn] fastp supports up to {FASTP_MAX_THREADS} threads; capping from {threads} to {FASTP_MAX_THREADS}",
+            file=sys.stderr
+        )
+        threads = FASTP_MAX_THREADS
 
     # parse front trimming
     per_r1: Dict[str, int] = {}

@@ -23,7 +23,7 @@ class MappingEvaluator:
         self._contam = ContaminationEvaluator(args)
         self._align = MappingYieldEvaluator(args)
 
-    def evaluate_qc(self, fastq_stage: str = "auto") -> None:
+    def evaluate_qc(self, fastq_stage: str = "processed") -> None:
         self._qc.evaluate_qc(fastq_stage=fastq_stage)
 
     def evaluate_contamination(self):

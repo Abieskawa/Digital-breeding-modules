@@ -16,31 +16,28 @@ class FastQCEvaluator(MappingEvalBase):
       0/1: FastQC + MultiQC
     """
 
-    def evaluate_qc(self, fastq_stage: str = "auto") -> None:
+    def evaluate_qc(self, fastq_stage: str = "processed") -> None:
         """
         Run FastQC + MultiQC on FASTQs from a specified stage.
         fastq_stage:
           - 'raw': only consider the original input directory
           - 'processed': only consider fastp-cleaned outputs
-          - 'auto' (default): prefer processed, fall back to raw if nothing found
         """
-        stage = (fastq_stage or "auto").strip().lower()
-        choices = {"raw", "processed", "auto"}
+        stage = (fastq_stage or "processed").strip().lower()
+        choices = {"raw", "processed"}
         if stage not in choices:
-            stage = "auto"
+            stage = "processed"
 
         stage_dirs = []
-        if stage in {"processed", "auto"}:
+        if stage == "processed":
             stage_dirs.append(("processed", self.fastp_outdir))
-        if stage in {"raw", "auto"}:
+        if stage == "raw":
             stage_dirs.append(("raw", self.input_dir))
 
-        used_stage = None
         pairs = []
         for label, wd in stage_dirs:
             pairs = _discover_pairs_in_dir(wd)
             if pairs:
-                used_stage = label
                 break
 
         fastqs: List[Path] = []
@@ -52,7 +49,7 @@ class FastQCEvaluator(MappingEvalBase):
             time_stamp(f"[qc] no FASTQs found for stage '{stage}'; skip")
             return
 
-        stage_dir = used_stage or stage
+        stage_dir = stage
         fq_out = self.report_dir / "fastqc" / stage_dir
         mq_out = self.report_dir / "multiqc" / stage_dir
         fq_out.mkdir(parents=True, exist_ok=True)

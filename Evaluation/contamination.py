@@ -9,9 +9,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-from Utils.utils import call_log, time_stamp
-from Evaluation.mapping_base import MappingEvalBase
-from Evaluation.mapping_utils import (
+from Utils.utils import (
     _annotate_box_fliers,
     _append_log_line,
     _discover_pairs_in_dir,
@@ -19,7 +17,10 @@ from Evaluation.mapping_utils import (
     _prepare_kraken_inputs,
     _run_kraken2,
     _summarize_kreport_species,
+    call_log,
+    time_stamp,
 )
+from Evaluation.mapping_base import MappingEvalBase
 
 
 class ContaminationEvaluator(MappingEvalBase):

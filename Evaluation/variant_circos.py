@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from pycirclize import Circos
 
-from Utils.utils import call_log, time_stamp
+from Utils.utils import _append_log_line, call_log, time_stamp
 
 
 def _format_bp(x: int) -> str:
@@ -46,11 +46,7 @@ def make_circos_for_vcf(
     vcf_pos: Dict[str, List[int]],
     window: int,
     out_png: Path,
-    gene_window: Optional[int] = None,
-    var_window: Optional[int] = None,
     tick_step: Optional[int] = None,
-    gene_cap_override: Optional[float] = None,
-    var_cap_override: Optional[float] = None,
     dpi: int = 300,
 ) -> None:
     sectors = {k: v for k, v in fasta_lens.items() if v > 0}
@@ -58,10 +54,8 @@ def make_circos_for_vcf(
         return
 
     binned: Dict[str, Dict] = {}
-    global_gene_max = 0
-    global_var_max = 0
-    gwin = gene_window if gene_window is not None else window
-    vwin = var_window if var_window is not None else window
+    gwin = window
+    vwin = window
     for chrom, L in sectors.items():
         nbin_g = max(1, int(np.ceil(L / gwin)))
         edges_g = np.linspace(0, L, nbin_g + 1)
@@ -96,10 +90,11 @@ def make_circos_for_vcf(
             var_width=vwin,
             L=L,
         )
-        if gene_vals.size:
-            global_gene_max = max(global_gene_max, int(gene_vals.max()))
-        if var_vals.size:
-            global_var_max = max(global_var_max, int(var_vals.max()))
+
+    gene_maxes = [int(v["gene_vals"].max()) for v in binned.values() if v["gene_vals"].size]
+    var_maxes = [int(v["var_vals"].max()) for v in binned.values() if v["var_vals"].size]
+    global_gene_max = max(gene_maxes) if gene_maxes else 0
+    global_var_max = max(var_maxes) if var_maxes else 0
 
     n_sectors = len(sectors)
     space = 5 if n_sectors <= 10 else 3 if n_sectors <= 22 else 1
@@ -152,7 +147,7 @@ def make_circos_for_vcf(
                 tick_length=0.9,
             )
 
-        var_cap = var_cap_override if (var_cap_override and var_cap_override > 0) else float(global_var_max or 1)
+        var_cap = float(global_var_max or 1)
         var_track = sector.add_track((80, 92), r_pad_ratio=0.05)
         var_track.axis(fc="#f5f5f5", ec="none", alpha=1.0)
         if var_vals.any():
@@ -166,7 +161,7 @@ def make_circos_for_vcf(
                 ec="none",
             )
 
-        gene_cap = gene_cap_override if (gene_cap_override and gene_cap_override > 0) else float(global_gene_max or 1)
+        gene_cap = float(global_gene_max or 1)
         gene_track = sector.add_track((70, 80), r_pad_ratio=0.05)
         gene_track.axis(fc="#f5f5f5", ec="none", alpha=1.0)
         if gene_vals.any():
@@ -223,9 +218,6 @@ def gff_gene_starts(gff: Path, include_biotype: Optional[str]) -> Dict[str, List
             attrs = {kv.split("=", 1)[0]: kv.split("=", 1)[1] for kv in c[8].split(";") if "=" in kv}
             biotype = (
                 attrs.get("gene_biotype")
-                or attrs.get("biotype")
-                or attrs.get("gene_type")
-                or attrs.get("transcript_biotype")
             )
             if include_biotype and biotype is not None and biotype != include_biotype:
                 continue
@@ -280,15 +272,6 @@ def prepare_circos_reference(
     return True, fasta_lens, gene_starts, rename_map, ordered
 
 
-def _append_log_line(log_dir: Path, step: str, msg: str) -> Path:
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{step}.log"
-    with open(log_path, "a", encoding="utf-8") as fh:
-        fh.write(msg.rstrip() + "\n")
-    return log_path
-
-
 def _optional_int(val, default=None, none_if_blank: bool = True):
     if val in (None, "", False):
         return None if none_if_blank else default
@@ -329,20 +312,8 @@ class VariantCircosEvaluator:
 
         self.gff_biotype   = getattr(args, "gff_biotype", None)
         self.circos_window = _optional_int(getattr(args, "circos_window", None), default=10000, none_if_blank=False) or 10000
-        self.circos_gene_window = _optional_int(getattr(args, "circos_gene_window", None), default=None, none_if_blank=True)
-        self.circos_var_window  = _optional_int(getattr(args, "circos_var_window",  None), default=None, none_if_blank=True)
         self.circos_tick_step = _optional_int(getattr(args, "circos_tick_step", None), default=None, none_if_blank=True)
         self.circos_chroms = list(getattr(args, "circos_chroms", []) or [])
-        try:
-            gcap = getattr(args, "circos_gene_max", None)
-            self.circos_gene_max = float(gcap) if gcap not in (None, "", False) else None
-        except Exception:
-            self.circos_gene_max = None
-        try:
-            vcap = getattr(args, "circos_var_max", None)
-            self.circos_var_max = float(vcap) if vcap not in (None, "", False) else None
-        except Exception:
-            self.circos_var_max = None
         try:
             self.target_seq  = int(getattr(args, "target_seq", 0))
         except Exception:
@@ -425,20 +396,14 @@ class VariantCircosEvaluator:
                     )
 
                 out_png = circos_dir / f"{stem}.circos.png"
-                gw = self.circos_gene_window or self.circos_window
-                vw = self.circos_var_window or self.circos_window
-                time_stamp(f"[variants] circos params: tick_step={self.circos_tick_step}, gene_window={gw}, var_window={vw}")
+                time_stamp(f"[variants] circos params: tick_step={self.circos_tick_step}, window={self.circos_window}")
                 make_circos_for_vcf(
                     fasta_lens=fasta_lens,
                     gene_starts=gene_starts,
                     vcf_pos=vpos,
                     window=self.circos_window,
-                    gene_window=self.circos_gene_window or self.circos_window,
-                    var_window=self.circos_var_window or self.circos_window,
                     out_png=out_png,
                     tick_step=self.circos_tick_step,
-                    gene_cap_override=self.circos_gene_max,
-                    var_cap_override=self.circos_var_max,
                 )
                 time_stamp(f"[variants] circos: {out_png}")
 

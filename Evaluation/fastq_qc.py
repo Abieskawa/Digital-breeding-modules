@@ -6,9 +6,8 @@ import sys
 from pathlib import Path
 from typing import List
 
-from Utils.utils import call_log, time_stamp
+from Utils.utils import _discover_pairs_in_dir, call_log, time_stamp
 from Evaluation.mapping_base import MappingEvalBase
-from Evaluation.mapping_utils import _discover_pairs_in_dir
 
 
 class FastQCEvaluator(MappingEvalBase):

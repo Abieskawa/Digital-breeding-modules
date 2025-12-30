@@ -14,7 +14,7 @@ from Prediction_model.model_construction import ModelConstruction
 import argparse
 from Evaluation.fastq_qc import FastQCEvaluator
 from Evaluation.contamination import ContaminationEvaluator
-from Evaluation.mapping_yield import MappingYieldEvaluator
+from Evaluation.evaluate_mapping import MappingYieldEvaluator
 from Evaluation.variant_circos import VariantCircosEvaluator
 
 def _coerce_int(name: str, raw: str, default: int) -> int:
@@ -192,8 +192,6 @@ class PredictionPipeline(object):
 
         self.gff_biotype = configure.get("gff_biotype", "protein_coding")
         self.circos_window = _coerce_int("circos_window", configure.get("circos_window",""), 10000)  # in bp
-        self.circos_gene_window = _coerce_int("circos_gene_window", configure.get("circos_gene_window", ""), 0) or None
-        self.circos_var_window  = _coerce_int("circos_var_window",  configure.get("circos_var_window",  ""), 0) or None
         self.circos_tick_step   = _coerce_int("circos_tick_step",   configure.get("circos_tick_step",   ""), 0) or None
         chroms_raw = (configure.get("circos_chroms", "") or "").replace(";", ",")
         self.circos_chroms = [c.strip() for c in chroms_raw.split(",") if c.strip()]
@@ -400,7 +398,6 @@ class PredictionPipeline(object):
                 if step_id in steps_to_run:
                     self._run_core_step(step_id)
                 self._run_eval_step(step_id)
-
             time_stamp("Pipeline complete")
         finally:
             self._cleanup_temp_cache()

@@ -58,11 +58,9 @@ ld_param=2.0
 
 ## Circos parameters
 gff_biotype=protein_coding
-circos_window=10000 #bp
-# Optional: control circos tick spacing and per-track bin sizes
+circos_window=10000 # bp; bin size for both gene and variant tracks
+# Optional: control circos tick spacing
 circos_tick_step=10000000    # bp; set e.g., 10000000 for 10 Mb fixed tick spacing; if blank -> only 0 and end
-circos_gene_window=100000
-circos_var_window=100000
 # Number of longest chromosomes/contigs to plot in circos (e.g., 21 = top 21 by length)
 target_seq=21
 # Alternatively, restrict circos to specific chromosomes/contigs (comma-separated). Leave blank to plot all.

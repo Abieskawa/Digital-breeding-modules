@@ -1,11 +1,13 @@
 # Utils/utils.py
+import gzip
 import os
 import shutil
 import subprocess as sbp
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path  # <-- add this
-from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
+from typing import Dict, Iterable, List, Optional, TYPE_CHECKING, Tuple
 from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
@@ -47,6 +49,141 @@ def read_config(config_file) -> Dict[str, str]:
             k, v = line.split("=", 1)
             cfg[k.strip()] = v.strip()
     return cfg
+
+def parse_int_list(raw: str) -> List[int]:
+    if raw is None:
+        return []
+    s = str(raw).strip()
+    if not s:
+        return []
+    parts = []
+    for chunk in s.replace("\t", " ").replace("\n", " ").split(","):
+        if chunk.strip():
+            parts.extend([p for p in chunk.split(" ") if p.strip()])
+    return [int(p) for p in parts]
+
+def coerce_bool(raw, default: bool) -> bool:
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s == "":
+        return default
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+def extract_vcf_samples(vcf_path: Path) -> List[str]:
+    """
+    Read only the VCF header to obtain sample IDs (columns 10+).
+    Works for plain VCF and bgzip/gz VCF.
+    """
+    with open(vcf_path, "rb") as f:
+        sig = f.read(2)
+    opener = gzip.open if sig == b"\x1f\x8b" else open
+    with opener(vcf_path, "rt") as f:
+        for line in f:
+            if line.startswith("#CHROM"):
+                cols = line.rstrip("\n").split("\t")
+                return cols[9:]
+    return []
+
+
+def _ensure_bgzip_and_index(vcf_path: Path) -> Path:
+    """
+    Ensure <vcf>.gz exists and is indexed (csi/tbi).
+    Returns the gz path.
+    """
+    gz_path = Path(str(vcf_path) + ".gz")
+    if not gz_path.exists():
+        time_stamp(f"Creating bgzip VCF: {gz_path}")
+        sbp.run(f"bgzip -c {vcf_path} > {gz_path}", shell=True, check=True)
+    if not (Path(str(gz_path) + ".csi").exists() or Path(str(gz_path) + ".tbi").exists()):
+        time_stamp(f"Indexing bgzip VCF: {gz_path}")
+        sbp.run(f"bcftools index {gz_path}", shell=True, check=True)
+    return gz_path
+
+def setup_local_env(outdir: Path) -> Tuple[Path, Path]:
+    """
+    Keep temp/cache writes inside the configured output directory.
+    """
+    outdir = Path(outdir)
+    tmp_dir = outdir / ".tmp"
+    mpl_dir = outdir / ".cache" / "matplotlib"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    mpl_dir.mkdir(parents=True, exist_ok=True)
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        os.environ[key] = str(tmp_dir)
+    os.environ["MPLCONFIGDIR"] = str(mpl_dir)
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    return tmp_dir, mpl_dir
+
+def parallel_process(items: List[tuple], process_func, max_workers: int = 8, raise_on_error: bool = False):
+    """
+    Perform parallel processing using ProcessPoolExecutor.
+    Each item in `items` is a tuple of arguments for `process_func`.
+    """
+    print(f"Starting parallel processing with {max_workers} workers")
+    results = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_func, item) for item in items]
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                print(f"Task failed with exception: {e}")
+                if raise_on_error:
+                    raise
+    print("Parallel processing complete")
+    return results
+
+def _resolve_outdir(
+    config: Optional[Dict[str, str]] = None,
+    key: str = "output_dir",
+    base_outdir: Optional[Path] = None,
+    default: str = "DGBreeding",
+    subdir: Optional[str] = None,
+    resolve: bool = False,
+    ensure_dir: bool = False,
+) -> Path:
+    """
+    Resolve output directories consistently (supports base, keyed, and subdir paths).
+    Optionally create the directory when ensure_dir=True.
+    """
+    if base_outdir is None:
+        if config is None:
+            base_outdir = Path(default)
+        else:
+            if key == "output_dir":
+                raw = config.get(key, None)
+                raw = str(raw).strip() if raw is not None else ""
+                base_outdir = Path(raw or default)
+            else:
+                raw_base = config.get("output_dir", None)
+                raw_base = str(raw_base).strip() if raw_base is not None else ""
+                base_outdir = Path(raw_base or default)
+    else:
+        base_outdir = Path(base_outdir)
+
+    base_outdir = base_outdir.expanduser()
+
+    if config is not None and key != "output_dir":
+        raw = config.get(key, None)
+        raw = str(raw).strip() if raw is not None else ""
+        if raw:
+            override = Path(raw).expanduser()
+            base_outdir = override if override.is_absolute() else base_outdir / override
+
+    if subdir:
+        base_outdir = base_outdir / subdir
+
+    outdir = base_outdir.resolve() if resolve else base_outdir
+    if ensure_dir:
+        outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
 
 def run_quiet(cmd, workdir=None, step='cmd', logdir=None):
     """Run a shell command quietly, optionally logging stdout/stderr to a file."""
@@ -136,6 +273,42 @@ R1_PATTERNS_RAW = [
 ]
 
 
+def _discover_pairs(
+    wd: Path,
+    r1_patterns: List[str],
+    *,
+    require_r2: bool,
+    sort_paths: bool = True,
+) -> List[Tuple[str, str, Path, Optional[Path]]]:
+    wd = Path(wd)
+    seen = set()
+    pairs: List[Tuple[str, str, Path, Optional[Path]]] = []
+    for pat in r1_patterns:
+        it = sorted(wd.glob(pat)) if sort_paths else wd.glob(pat)
+        for r1p in it:
+            fname = r1p.name
+            if "_R1." in fname:
+                base, ext = fname.split("_R1.", 1)
+                r2n = f"{base}_R2.{ext}"
+                style = "R"
+            elif "_1." in fname:
+                base, ext = fname.split("_1.", 1)
+                r2n = f"{base}_2.{ext}"
+                style = "1"
+            else:
+                continue
+            r2p = wd / r2n
+            if require_r2 and not r2p.exists():
+                print(f"[info] Skip {fname}: missing pair {r2n}", file=sys.stderr)
+                continue
+            key = (base, r1p.name, r2p.name if r2p.exists() else "")
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append((base, style, r1p, r2p if r2p.exists() else None))
+    return pairs
+
+
 def _discover_pairs_in_dir(wd: Path) -> List[Dict]:
     """
     Return list of {sample, r1, r2|None}, preferring fastp-cleaned names,
@@ -143,143 +316,39 @@ def _discover_pairs_in_dir(wd: Path) -> List[Dict]:
     'sample' is the basename before _R1/_1 suffix + extension.
     """
     wd = Path(wd)
-    pairs: List[Dict] = []
+    pairs: List[Tuple[str, str, Path, Optional[Path]]] = []
 
-    # Try cleaned patterns first, then raw patterns
-    seen = set()
     for patterns in (R1_PATTERNS_CLEANED, R1_PATTERNS_RAW):
-        for pat in patterns:
-            for r1p in sorted(wd.glob(pat)):
-                name = r1p.name
-                if "_R1." in name:
-                    base, ext = name.split("_R1.", 1)
-                    r2n = f"{base}_R2.{ext}"
-                elif "_1." in name:
-                    base, ext = name.split("_1.", 1)
-                    r2n = f"{base}_2.{ext}"
-                else:
-                    # doesn't match paired-end naming; skip
-                    continue
-
-                r2p = wd / r2n
-                sample = base
-                key = (sample, r1p, r2p)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                pairs.append(
-                    dict(
-                        sample=sample,
-                        r1=r1p,
-                        r2=r2p if r2p.exists() else None,
-                    )
-                )
-
-        # if we found anything with this tier of patterns, stop; don't fall back
+        pairs = _discover_pairs(wd, patterns, require_r2=False, sort_paths=True)
         if pairs:
             break
 
-    # If still nothing, consider single-end fastqs as singles
-    if not pairs:
-        all_fqs = (
-            sorted(wd.glob("*.fastq"))
-            + sorted(wd.glob("*.fq"))
-            + sorted(wd.glob("*.fastq.gz"))
-            + sorted(wd.glob("*.fq.gz"))
-        )
-        for p in all_fqs:
-            pairs.append(dict(sample=p.stem, r1=p, r2=None))
+    if pairs:
+        return [dict(sample=base, r1=r1p, r2=r2p) for base, _, r1p, r2p in pairs]
 
-    return pairs
+    all_fqs = (
+        sorted(wd.glob("*.fastq"))
+        + sorted(wd.glob("*.fq"))
+        + sorted(wd.glob("*.fastq.gz"))
+        + sorted(wd.glob("*.fq.gz"))
+    )
+    return [dict(sample=p.stem, r1=p, r2=None) for p in all_fqs]
 
 
-# --------------------------- Kraken2 helpers ---------------------------
-
-def _run_kraken2(
-    r1: Path,
-    r2: Optional[Path],
-    db: Path,
-    threads: int,
-    out_report: Path,
-    out_assign: Optional[Path] = None,
-    log_dir: Optional[Path] = None,
-    label: Optional[str] = None,
-    gzip_input: bool = True,
-) -> None:
+def discover_pairs_by_patterns(wd: Path, r1_patterns: List[str]) -> List[Tuple[str, str, str, str]]:
     """
-    Execute the built-in kraken2 command with the provided inputs.
+    Find paired-end files in wd, given R1 glob patterns.
+
+    Returns list of (basename, style, r1_name, r2_name)
+      style = "R" if filenames use _R1/_R2, else "1" for _1/_2
     """
-    out_report.parent.mkdir(parents=True, exist_ok=True)
-    if out_assign:
-        out_assign.parent.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "kraken2",
-        "--db", str(Path(db).resolve()),
-        "--threads", str(threads),
-        "--use-names",
-        "--report", str(Path(out_report).resolve()),
-    ]
-    if gzip_input:
-        cmd.append("--gzip-compressed")
-    if out_assign:
-        cmd += ["--output", str(Path(out_assign).resolve())]
-    if r2:
-        cmd.append("--paired")
-    cmd.append(str(r1))
-    if r2:
-        cmd.append(str(r2))
-
-    cmd = " ".join(a for a in cmd)
-    time_stamp(f"[contam] {cmd}")
-    stdout = None
-    stderr = None
-    log_handle = None
-    if log_dir:
-        log_dir = Path(log_dir)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "kraken2.log"
-        log_handle = open(log_path, "ab")
-        tag = label or "kraken2"
-        header = f"\n[{tag}] {cmd}\n".encode()
-        log_handle.write(header)
-        stdout = log_handle
-        stderr = sbp.STDOUT
-
-    try:
-        sbp.run(cmd, shell=True, check=True, stdout=stdout, stderr=stderr)
-    finally:
-        if log_handle:
-            log_handle.flush()
-            log_handle.close()
-
-
-def _summarize_kreport_species(kreport: Path) -> "pd.DataFrame":
-    """
-    Parse kreport -> species-level rows only (rank code starts with 'S').
-    Returns DataFrame columns: [name, pct, reads_clade, reads_direct, taxid, rank]
-    """
-    import pandas as pd
-
-    rows = []
-    with open(kreport) as fh:
-        for ln in fh:
-            parts = ln.rstrip("\n").split("\t")
-            if len(parts) < 6:  # pct, reads_clade, reads_direct, rank, taxid, name
-                continue
-            try:
-                pct = float(parts[0])
-                rc = int(parts[1])
-                rd = int(parts[2])
-            except (TypeError, ValueError):
-                continue
-            rank = parts[3].strip()
-            taxid = parts[4].strip()
-            name = parts[5].strip()
-            if rank and rank[0].upper() == "S":  # species-level
-                rows.append(dict(name=name, pct=pct, reads_clade=rc, reads_direct=rd, taxid=taxid, rank=rank))
-    return pd.DataFrame(rows)
+    pairs = _discover_pairs(wd, r1_patterns, require_r2=True, sort_paths=False)
+    results: List[Tuple[str, str, str, str]] = []
+    for base, style, r1p, r2p in pairs:
+        if r2p is None:
+            continue
+        results.append((base, style, r1p.name, r2p.name))
+    return results
 
 
 def _kreport_total_reads(kreport: Path) -> Optional[int]:
@@ -358,34 +427,6 @@ def _annotate_box_fliers(ax, x_values: Iterable, y_values: Iterable, labels: Ite
             pass
 
 
-# --------------------------- BAM / FASTQ counters ---------------------------
-
-def _count_mapped_primary_reads(bam: Path, threads: int) -> int:
-    """
-    Count mapped, primary, non-supplementary reads (exclude unmapped/secondary/supplementary).
-    """
-    cmd = f"samtools view -c -F 0x904 -@ {threads} {bam}"
-    try:
-        out = sbp.check_output(cmd, shell=True, text=True).strip()
-        return int(out)
-    except Exception:
-        call_log(bam.parent, "samtools_count_mapped_primary_reads", cmd)
-        return 0
-
-
-def _count_unmapped_primary_reads(bam: Path, threads: int) -> int:
-    """
-    Count unmapped primary reads (FLAG 0x4, excluding secondary/supplementary).
-    """
-    cmd = f"samtools view -c -f 0x4 -F 0x900 -@ {threads} {bam}"
-    try:
-        out = sbp.check_output(cmd, shell=True, text=True).strip()
-        return int(out)
-    except Exception:
-        call_log(bam.parent, "samtools_count_unmapped_primary_reads", cmd)
-        return 0
-
-
 def _count_reads_in_fastq(path: Path) -> int:
     """Number of reads = lines/4 (handles .gz, uses pigz for speed)."""
     if str(path).endswith(".gz"):
@@ -403,24 +444,3 @@ def _count_reads_in_fastq(path: Path) -> int:
     except Exception as e:
         time_stamp(f"[contam] failed to count reads in {path}: {e}")
         return 0
-
-
-def _prepare_kraken_inputs(sample: str, r1: Path, r2: Optional[Path]):
-    """
-    Return (r1_path, r2_path, total_reads, gzip_input) for Kraken2.
-    Returns None if no reads are present.
-    """
-    r1_reads = _count_reads_in_fastq(r1)
-    r2_reads = _count_reads_in_fastq(r2) if r2 else 0
-    if r2:
-        if r1_reads != r2_reads:
-            time_stamp(f"[contam] warning: read count mismatch for {sample} (R1={r1_reads}, R2={r2_reads}); using max")
-        total_pairs = max(r1_reads, r2_reads)
-    else:
-        total_pairs = r1_reads
-
-    if total_pairs == 0:
-        return None
-    gzip_input = str(r1).endswith(".gz") and (not r2 or str(r2).endswith(".gz"))
-
-    return r1, r2, total_pairs, gzip_input

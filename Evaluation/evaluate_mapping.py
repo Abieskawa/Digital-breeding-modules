@@ -3,16 +3,18 @@
 """
 Compatibility wrapper for legacy MappingEvaluator usage.
 """
+import subprocess as sbp
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
 from Utils.utils import (
     _annotate_box_fliers,
-    _count_mapped_primary_reads,
     _count_reads_in_fastq,
-    _count_unmapped_primary_reads,
     _discover_pairs_in_dir,
+    call_log,
     time_stamp,
 )
 from Evaluation.contamination import ContaminationEvaluator
@@ -24,6 +26,24 @@ class MappingYieldEvaluator(MappingEvalBase):
     """
     Step 2: Mapping yield ratio = unique (primary, non-supplementary) BAM reads / fastp reads.
     """
+
+    def _count_mapped_primary_reads(self, bam: Path, threads: int) -> int:
+        cmd = f"samtools view -c -F 0x904 -@ {threads} {bam}"
+        try:
+            out = sbp.check_output(cmd, shell=True, text=True).strip()
+            return int(out)
+        except Exception:
+            call_log(bam.parent, "samtools_count_mapped_primary_reads", cmd)
+            return 0
+
+    def _count_unmapped_primary_reads(self, bam: Path, threads: int) -> int:
+        cmd = f"samtools view -c -f 0x4 -F 0x900 -@ {threads} {bam}"
+        try:
+            out = sbp.check_output(cmd, shell=True, text=True).strip()
+            return int(out)
+        except Exception:
+            call_log(bam.parent, "samtools_count_unmapped_primary_reads", cmd)
+            return 0
 
     def evaluate_alignment(self) -> pd.DataFrame:
         if not self.align_dir.exists():
@@ -41,8 +61,8 @@ class MappingYieldEvaluator(MappingEvalBase):
         rows = []
         for bam in bams:
             sample = bam.stem
-            num_mapped = _count_mapped_primary_reads(bam, self.threads)
-            num_unmapped = _count_unmapped_primary_reads(bam, self.threads)
+            num_mapped = self._count_mapped_primary_reads(bam, self.threads)
+            num_unmapped = self._count_unmapped_primary_reads(bam, self.threads)
 
             denom_reads = None
             if sample in by_sample:

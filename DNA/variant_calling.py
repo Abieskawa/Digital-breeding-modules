@@ -2,25 +2,11 @@
 # DNA/variant_calling.py
 
 import shutil
+import subprocess as sbp
 from pathlib import Path
 from typing import List, Tuple
 
-from Utils.utils import run_quiet
-
-
-def _coerce_bool(raw, default: bool) -> bool:
-    if raw is None:
-        return default
-    if isinstance(raw, bool):
-        return raw
-    s = str(raw).strip().lower()
-    if s == "":
-        return default
-    if s in {"1", "true", "yes", "y", "on"}:
-        return True
-    if s in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
+from Utils.utils import run_quiet, time_stamp, coerce_bool
 
 
 class VariantCalling:
@@ -58,6 +44,8 @@ class VariantCalling:
         self.variant_outdir.mkdir(parents=True, exist_ok=True)
 
         self.deepvariant_image = getattr(args, 'deepvariant_image', 'google/deepvariant:1.9.0')
+        self.deepvariant_use_gpu = coerce_bool(getattr(args, 'deepvariant_use_gpu', None), False)
+        self._deepvariant_use_gpu_supported = None
         self.model_type        = getattr(args, 'model_type', 'WGS')
         cap                    = getattr(args, 'capture_bed', None)
         self.capture_bed       = Path(cap).resolve() if cap else None
@@ -68,7 +56,7 @@ class VariantCalling:
         ld_prune_raw = getattr(args, 'enable_ld_pruning', None)
         if ld_prune_raw is None:
             ld_prune_raw = getattr(args, 'ld_prune', None)
-        self.enable_ld_pruning = _coerce_bool(ld_prune_raw, True)
+        self.enable_ld_pruning = coerce_bool(ld_prune_raw, True)
 
         self.ld_method = str(getattr(args, 'ld_method', 'indep'))
         self.ld_window = int(getattr(args, 'ld_window', 50))
@@ -92,6 +80,21 @@ class VariantCalling:
         gz_vcf = raw_vcf.with_suffix('.vcf.gz')
         return raw_vcf, gz_vcf
 
+    def _deepvariant_supports_use_gpu(self, deepvariant_cmd: str) -> bool:
+        if self._deepvariant_use_gpu_supported is not None:
+            return self._deepvariant_use_gpu_supported
+        help_cmd = f"{deepvariant_cmd} --help"
+        try:
+            out = sbp.check_output(help_cmd, shell=True, text=True, stderr=sbp.STDOUT)
+        except Exception as exc:
+            time_stamp(f"[deepvariant] unable to verify --use_gpu support ({exc}); running without GPU flag.")
+            self._deepvariant_use_gpu_supported = False
+            return False
+        self._deepvariant_use_gpu_supported = "--use_gpu" in out
+        if not self._deepvariant_use_gpu_supported:
+            time_stamp("[deepvariant] --use_gpu not supported by this DeepVariant build; running without GPU flag.")
+        return self._deepvariant_use_gpu_supported
+
     # ---------------- DeepVariant (per sample) ----------------
 
     def run_deepvariant_one(self, sample: str, bam_path: Path) -> Tuple[Path, Path]:
@@ -106,12 +109,17 @@ class VariantCalling:
         if jemalloc_path.exists():
             deepvariant_bin = f"LD_PRELOAD={jemalloc_path} {deepvariant_bin}"
 
+        env_prefix = "TF_CPP_MIN_LOG_LEVEL=2 PYTHONWARNINGS=ignore"
+        gpu_arg = ""
+        if self.deepvariant_use_gpu and self._deepvariant_supports_use_gpu(deepvariant_bin):
+            gpu_arg = "--use_gpu"
         cmd = (
-            f"{deepvariant_bin} "
+            f"{env_prefix} {deepvariant_bin} "
             f"--model_type={self.model_type} "
             f"--ref={self.ref_fasta} "
             f"--reads={bam_dir}/{bam_path.name} "
             f"{regions_arg} "
+            f"{gpu_arg} "
             f"--output_vcf={self.variant_outdir}/{v_out.name} "
             f"--output_gvcf={self.variant_outdir}/{g_out.name} "
             f"--num_shards={self.threads}"

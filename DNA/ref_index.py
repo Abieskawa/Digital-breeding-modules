@@ -1,20 +1,21 @@
-from Utils.utils import run_quiet
+from Utils.utils import run_quiet, _resolve_outdir
 from pathlib import Path
 import shutil
 
 class RefIndex: 
     def __init__(self, args):
         self.args = args
-        self.outdir = Path(args.outdir)
+        self.outdir = _resolve_outdir(base_outdir=args.outdir)
         self.threads = args.threads
         self.ref_fasta = Path(args.ref_fasta).resolve()
         
 
     def run(self):
-        ref_index_outdir = Path(self.outdir / "01_DNAseq_alignment")
-
-        if not ref_index_outdir.exists():
-            ref_index_outdir.mkdir(parents=True, exist_ok=True)
+        ref_index_outdir = _resolve_outdir(
+            base_outdir=self.outdir,
+            subdir="01_DNAseq_alignment",
+            ensure_dir=True,
+        )
 
         # Write indices in the pipeline output directory to avoid permission issues on read-only refs
         dest_ref = ref_index_outdir / self.ref_fasta.name

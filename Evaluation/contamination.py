@@ -12,15 +12,118 @@ import seaborn as sns
 from Utils.utils import (
     _annotate_box_fliers,
     _append_log_line,
+    _count_reads_in_fastq,
     _discover_pairs_in_dir,
     _kreport_total_reads,
-    _prepare_kraken_inputs,
-    _run_kraken2,
-    _summarize_kreport_species,
     call_log,
     time_stamp,
 )
 from Evaluation.mapping_base import MappingEvalBase
+
+
+def _run_kraken2(
+    r1: Path,
+    r2: Optional[Path],
+    db: Path,
+    threads: int,
+    out_report: Path,
+    out_assign: Optional[Path] = None,
+    log_dir: Optional[Path] = None,
+    label: Optional[str] = None,
+    gzip_input: bool = True,
+) -> None:
+    out_report.parent.mkdir(parents=True, exist_ok=True)
+    if out_assign:
+        out_assign.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "kraken2",
+        "--db", str(Path(db).resolve()),
+        "--threads", str(threads),
+        "--use-names",
+        "--report", str(Path(out_report).resolve()),
+    ]
+    if gzip_input:
+        cmd.append("--gzip-compressed")
+    if out_assign:
+        cmd += ["--output", str(Path(out_assign).resolve())]
+    if r2:
+        cmd.append("--paired")
+    cmd.append(str(r1))
+    if r2:
+        cmd.append(str(r2))
+
+    cmd = " ".join(a for a in cmd)
+    time_stamp(f"[contam] {cmd}")
+    stdout = None
+    stderr = None
+    log_handle = None
+    if log_dir:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "kraken2.log"
+        log_handle = open(log_path, "ab")
+        tag = label or "kraken2"
+        header = f"\n[{tag}] {cmd}\n".encode()
+        log_handle.write(header)
+        stdout = log_handle
+        stderr = sbp.STDOUT
+
+    try:
+        sbp.run(cmd, shell=True, check=True, stdout=stdout, stderr=stderr)
+    finally:
+        if log_handle:
+            log_handle.flush()
+            log_handle.close()
+
+
+def _summarize_kreport_species(kreport: Path) -> pd.DataFrame:
+    rows = []
+    with open(kreport) as fh:
+        for ln in fh:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            try:
+                pct = float(parts[0])
+                rc = int(parts[1])
+                rd = int(parts[2])
+            except (TypeError, ValueError):
+                continue
+            rank = parts[3].strip()
+            taxid = parts[4].strip()
+            name = parts[5].strip()
+            if rank and rank[0].upper() == "S":
+                rows.append(
+                    dict(
+                        name=name,
+                        pct=pct,
+                        reads_clade=rc,
+                        reads_direct=rd,
+                        taxid=taxid,
+                        rank=rank,
+                    )
+                )
+    return pd.DataFrame(rows)
+
+
+def _prepare_kraken_inputs(sample: str, r1: Path, r2: Optional[Path]):
+    r1_reads = _count_reads_in_fastq(r1)
+    r2_reads = _count_reads_in_fastq(r2) if r2 else 0
+    if r2:
+        if r1_reads != r2_reads:
+            time_stamp(
+                f"[contam] warning: read count mismatch for {sample} (R1={r1_reads}, R2={r2_reads}); using max"
+            )
+        total_pairs = max(r1_reads, r2_reads)
+    else:
+        total_pairs = r1_reads
+
+    if total_pairs == 0:
+        return None
+    gzip_input = str(r1).endswith(".gz") and (not r2 or str(r2).endswith(".gz"))
+
+    return r1, r2, total_pairs, gzip_input
 
 
 class ContaminationEvaluator(MappingEvalBase):

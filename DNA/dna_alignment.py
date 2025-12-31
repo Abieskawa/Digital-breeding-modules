@@ -1,6 +1,6 @@
 import sys
 import subprocess as sbp # enable activate and terminate program
-from Utils.utils import call_log, time_stamp
+from Utils.utils import call_log, time_stamp, discover_pairs_by_patterns
 from typing import List, Dict, Set, Tuple
 from pathlib import Path
 
@@ -53,32 +53,7 @@ class DNAAlignment:
         Returns list of (basename, style, r1_name, r2_name)
         style = "R" if filenames use _R1.cleaned/_R2.cleaned, else "1" for _1.cleaned/_2.cleaned
         """
-        seen = set()
-        pairs: List[Tuple[str, str, str, str]] = []
-        for pat in R1_PATTERNS:
-            for r1p in wd.glob(pat):
-                fname = r1p.name
-                if "_R1.cleaned" in fname:
-                    base = fname.split("_R1.", 1)[0]
-                    ext = fname.split("_R1.", 1)[1]
-                    r2 = f"{base}_R2.{ext}"
-                    style = "R"
-                elif "_1.cleaned" in fname:
-                    base = fname.split("_1.", 1)[0]
-                    ext = fname.split("_1.", 1)[1]
-                    r2 = f"{base}_2.{ext}"
-                    style = "1"
-                else:
-                    continue
-                r2p = wd / r2
-                if r2p.exists():
-                    key = (base, r1p.name, r2p.name)
-                    if key not in seen:
-                        seen.add(key)
-                        pairs.append((base, style, r1p.name, r2p.name))
-                else:
-                    print(f"[info] Skip {fname}: missing pair {r2}", file=sys.stderr)
-        return pairs
+        return discover_pairs_by_patterns(wd, R1_PATTERNS)
     
     @staticmethod
     def _normalize_mem(mem: str) -> str:

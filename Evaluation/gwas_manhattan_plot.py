@@ -29,11 +29,8 @@ def main():
     repo_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repo_root))
 
-    from Prediction_model.prediction_model import (
-        SNPPredictionModelTool,
-        parallel_process,
-    )
-    from Utils.utils import read_config
+    from Prediction_model.prediction_model import SNPPredictionModelTool
+    from Utils.utils import read_config, parallel_process
 
     config = read_config(args.config_file)
     tools = SNPPredictionModelTool(config)

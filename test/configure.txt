@@ -31,6 +31,7 @@ skip_variant_samples=    # optional: skip these samples in variant calling (defa
 
 # Step 3: Variant calling
 model_type=WGS
+# deepvariant_use_gpu=false   # Optional: pass --use_gpu to DeepVariant if GPU build/drivers are available
 # capture_bed=        # Optional: path to a pre-built capture BED (leave blank when auto-generating)
 # Optional: auto-generate capture BED for GLnexus
 generate_bed=true
@@ -68,6 +69,8 @@ target_seq=21
 
 # Model construction:
 num_splits=10  # x-fold cross-validation
+random_state=2024  # CV split seed
+cv_folds_file=  # Optional: reuse saved CV folds (default: <prediction_output_dir>/cv_folds.tsv)
 
 # Step 4: BLINK GWAS / PCA
 # BLINK (GWAS)
@@ -86,6 +89,7 @@ vcf_file_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/fil
 chromosome_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/chromsome_recode.csv
 #chromsome_recode.csv #AtPolyDB/chromsome_recode.csv
 prediction_output_dir=prediction
+# step5_mode=full or model_only (model_only reuses existing Model_result CSVs)
 # If blank, prediction model uses output_dir; relative paths are under output_dir
 prediction_python= # Optional: override python path for step 5 (e.g., /opt/conda/envs/DGbreeding-ml/bin/python)
 

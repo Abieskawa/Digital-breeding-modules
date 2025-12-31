@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import gzip
-import os
 import subprocess as sbp
 from collections import defaultdict
 from pathlib import Path
@@ -12,7 +11,7 @@ import numpy as np
 import pandas as pd
 from pycirclize import Circos
 
-from Utils.utils import _append_log_line, call_log, time_stamp
+from Utils.utils import _append_log_line, call_log, time_stamp, _resolve_outdir, setup_local_env
 
 
 def _format_bp(x: int) -> str:
@@ -290,21 +289,12 @@ class VariantCircosEvaluator:
     """
 
     def _setup_local_env(self) -> None:
-        tmp_dir = self.outdir / ".tmp"
-        mpl_dir = self.outdir / ".cache" / "matplotlib"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        mpl_dir.mkdir(parents=True, exist_ok=True)
-        for key in ("TMPDIR", "TEMP", "TMP"):
-            os.environ[key] = str(tmp_dir)
-        os.environ["MPLCONFIGDIR"] = str(mpl_dir)
-        os.environ.setdefault("MPLBACKEND", "Agg")
-        self.tmp_dir = tmp_dir
-        self.mpl_config_dir = mpl_dir
+        self.tmp_dir, self.mpl_config_dir = setup_local_env(self.outdir)
 
     def __init__(self, args):
         self.threads   = int(getattr(args, "threads", 1))
-        self.outdir    = Path(getattr(args, "outdir", ".")).resolve()
-        self.variant_dir = Path(getattr(args, "variant_outdir", self.outdir)).resolve()
+        self.outdir    = _resolve_outdir(base_outdir=getattr(args, "outdir", "."), resolve=True)
+        self.variant_dir = _resolve_outdir(base_outdir=getattr(args, "variant_outdir", self.outdir), resolve=True)
         self.ref_fasta = Path(getattr(args, "ref_fasta", "")).expanduser().resolve() if getattr(args, "ref_fasta", None) else None
         self.gff       = Path(getattr(args, "gff", "")).expanduser().resolve() if getattr(args, "gff", None) else None
 
@@ -319,8 +309,12 @@ class VariantCircosEvaluator:
         except Exception:
             self.target_seq  = 0
 
-        self.report_dir = self.outdir / "evaluation"
-        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.report_dir = _resolve_outdir(
+            base_outdir=self.outdir,
+            subdir="evaluation",
+            resolve=True,
+            ensure_dir=True,
+        )
         (self.report_dir / "logs").mkdir(parents=True, exist_ok=True)
 
     @staticmethod

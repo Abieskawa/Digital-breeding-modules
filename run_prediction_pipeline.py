@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, shutil, subprocess, sys
+import argparse, os, sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set
@@ -13,12 +13,14 @@ from Evaluation.contamination import ContaminationEvaluator
 from Evaluation.evaluate_mapping import MappingYieldEvaluator
 from Evaluation.fastq_qc import FastQCEvaluator
 from Evaluation.variant_circos import VariantCircosEvaluator
+from Evaluation.gwas_manhattan_plot import GWASManhattanPlotRunner
+from Evaluation.prediction_roc_plot import PredictionRocPlotRunner
 from Utils.bed_generator import build_capture_bed
-from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool
+from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool, _save_numeric_npz
 from Utils.cv_preparation import CV_preparation
-from Prediction_model.gwas_pca import GWAS_PCA, PredictionGWASCVStep
-from Prediction_model.model_construction import ModelConstruction, PredictionModelCVStep
-from Prediction_model.snp_numeric_transformer import SNP_numerical, _save_numeric_npz
+from Prediction_model.gwas_pca import GWAS_PCA
+from Prediction_model.model_construction import ModelConstruction
+from Prediction_model.snp_numeric_transformer import SNP_numerical
 
 def _coerce_int(name: str, raw: str, default: int) -> int:
     """
@@ -57,13 +59,6 @@ def _parse_steps(raw: str) -> Set[str]:
     return {p for p in parts}
 
 
-def _parse_list(raw: str) -> Set[str]:
-    """
-    Parse comma/semicolon-separated list into a set of non-empty strings.
-    """
-    return set(_parse_list_ordered(raw))
-
-
 def _parse_list_ordered(raw: str) -> List[str]:
     """
     Parse comma/semicolon-separated list into a de-duplicated list (preserve order).
@@ -82,44 +77,31 @@ def _parse_list_ordered(raw: str) -> List[str]:
     return ordered
 
 
-def _load_fold_job(job: Dict[str, object]):
-    config_file = str(job["config_file"])
-    repo_root = Path(str(job["repo_root"]))
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+def _ensure_repo_root(repo_root: Optional[str]) -> None:
+    if not repo_root:
+        return
+    root = str(Path(repo_root))
+    if root and root not in sys.path:
+        sys.path.insert(0, root)
 
-    config = read_config(config_file)
-    return (
-        config,
-        str(job["file_fold_index"]),
-        str(job.get("gwas_pcs", "") or ""),
-        str(job.get("top_n_snps", "") or ""),
-        str(job.get("models", "") or ""),
-        int(job.get("inner_model_workers", 1)),
+
+def _default_gwas_pcs(config: Dict[str, str]) -> List[int]:
+    pcs = (
+        parse_int_list(config.get("gwas_n_pcs_list", ""))
+        or parse_int_list(config.get("gwas_n_pcs", ""))
+        or parse_int_list(config.get("n_pcs_list", "0"))
     )
+    return pcs or [0]
 
 
-def _cv_gwas_worker(job: Dict[str, object]) -> str:
-    fold_cfg = CV_preparation.read_fold_config(Path(str(job["fold_config"])))
-    config = read_config(fold_cfg["config_file"])
-    file_fold_index = fold_cfg["file_fold_index"]
-    gwas_pcs = str(fold_cfg.get("gwas_pcs", "") or "")
-    pca_n_components = CV_preparation.parse_optional_int(fold_cfg.get("pca_n_components"))
-
-    train_samples = CV_preparation.read_samples_file(Path(fold_cfg["train_samples_file"]))
-    if not train_samples:
-        raise ValueError(f"No train samples found in {fold_cfg['train_samples_file']}")
-
+def _prepare_fold_numeric_npz(
+    config: Dict[str, str],
+    *,
+    file_fold_index: str,
+    train_samples: List[str],
+    prediction_outdir: Path,
+) -> Path:
     snp_tool = SNP_numerical(config)
-    gwas_tool = GWAS_PCA(config)
-
-    prediction_outdir = _resolve_outdir(
-        config,
-        key="prediction_output_dir",
-        default="results",
-        resolve=True,
-        ensure_dir=True,
-    )
     tmp_dir = prediction_outdir / ".tmp" / "prediction_cv" / f"fold_{file_fold_index}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     npz_path = tmp_dir / "train_numeric.npz"
@@ -130,98 +112,133 @@ def _cv_gwas_worker(job: Dict[str, object]) -> str:
         raise ValueError("No requested train samples were found in the VCF.")
     genotype_numeric = snp_tool.convert_genotypes_to_numeric(genotype_df.loc[present])
     _save_numeric_npz(genotype_numeric, str(npz_path))
+    return npz_path
+
+
+def _cv_gwas_pc_worker(job: Dict[str, object]) -> str:
+    _ensure_repo_root(str(job.get("repo_root", "") or ""))
+    config = read_config(str(job["config_file"]))
+    gwas_tool = GWAS_PCA(config)
+    file_fold_index = str(job["file_fold_index"])
+    gwas_pc = str(job["gwas_pc"])
+    pca_n_components = job.get("pca_n_components")
 
     gwas_tool.run_fold(
         file_fold_index,
-        str(npz_path),
-        gwas_pcs_override=gwas_pcs,
+        str(job["npz_path"]),
+        gwas_pcs_override=gwas_pc,
         pca_components_override=pca_n_components,
     )
-    return file_fold_index
+    return f"{file_fold_index}_{gwas_pc}PCs"
 
 
-def _cv_model_prep_worker(job: Dict[str, object]) -> str:
-    fold_cfg = CV_preparation.read_fold_config(Path(str(job["fold_config"])))
+def _build_model_jobs_for_fold(
+    fold_cfg_path: Path,
+    *,
+    prepare: bool,
+    repo_root: Path,
+) -> List[Dict[str, object]]:
+    fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
     config = read_config(fold_cfg["config_file"])
-    file_fold_index = fold_cfg["file_fold_index"]
+    file_fold_index = str(fold_cfg["file_fold_index"])
     gwas_pcs = str(fold_cfg.get("gwas_pcs", "") or "")
     top_n_snps = str(fold_cfg.get("top_n_snps", "") or "")
     models = str(fold_cfg.get("models", "") or "")
-    inner_model_workers = int(job.get("inner_model_workers", 1))
-
-    test_samples = CV_preparation.read_samples_file(Path(fold_cfg["test_samples_file"]))
-    if not test_samples:
-        raise ValueError(f"No test samples found in {fold_cfg['test_samples_file']}")
 
     snp_tool = SNP_numerical(config)
     model_tool = ModelConstruction(config)
 
-    genotype_df = snp_tool.vcf_to_dataframe(snp_tool.vcf_file_path)
-    present = [s for s in test_samples if s in genotype_df.index]
-    if not present:
-        raise ValueError("No requested test samples were found in the VCF.")
-    test_df = genotype_df.loc[present]
-
     pcs = parse_int_list(gwas_pcs) if gwas_pcs.strip() else snp_tool.gwas_n_pcs_list
+    if not pcs:
+        pcs = [0]
     nsnps = parse_int_list(top_n_snps) if top_n_snps.strip() else snp_tool.top_n_snps_list
+    if not nsnps:
+        nsnps = [10]
+    models_list = [m.strip() for m in models.split(",") if m.strip()] if models.strip() else model_tool.models
 
+    if prepare:
+        test_samples = CV_preparation.read_samples_file(Path(fold_cfg["test_samples_file"]))
+        if not test_samples:
+            raise ValueError(f"No test samples found in {fold_cfg['test_samples_file']}")
+
+        genotype_df = snp_tool.vcf_to_dataframe(snp_tool.vcf_file_path)
+        present = [s for s in test_samples if s in genotype_df.index]
+        if not present:
+            raise ValueError("No requested test samples were found in the VCF.")
+        test_df = genotype_df.loc[present]
+
+        for pc in pcs:
+            file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
+            for n_snp in nsnps:
+                file_fold_npc_nsnp_index = f"{file_fold_npc_index}_{n_snp}SNPs"
+                selected = snp_tool.select_markers_and_prepare_data_for_model_construction(
+                    file_fold_npc_index=file_fold_npc_index,
+                    file_fold_npc_nsnp_index=file_fold_npc_nsnp_index,
+                    test_df=test_df,
+                    top_n_snps=n_snp,
+                )
+                save_dir = os.path.join(snp_tool.model_output_dir, file_fold_npc_nsnp_index)
+                with open(os.path.join(save_dir, "selected_snps.txt"), "w") as f:
+                    for snp in selected:
+                        f.write(f"{snp}\n")
+
+    jobs: List[Dict[str, object]] = []
+    config_file = str(Path(fold_cfg["config_file"]).expanduser())
     for pc in pcs:
-        file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
         for n_snp in nsnps:
-            file_fold_npc_nsnp_index = f"{file_fold_npc_index}_{n_snp}SNPs"
-            selected = snp_tool.select_markers_and_prepare_data_for_model_construction(
-                file_fold_npc_index=file_fold_npc_index,
-                file_fold_npc_nsnp_index=file_fold_npc_nsnp_index,
-                test_df=test_df,
-                top_n_snps=n_snp,
-            )
-            save_dir = os.path.join(snp_tool.model_output_dir, file_fold_npc_nsnp_index)
-            with open(os.path.join(save_dir, "selected_snps.txt"), "w") as f:
-                for snp in selected:
-                    f.write(f"{snp}\n")
-
-    models_list = [m.strip() for m in models.split(",") if m.strip()] if models.strip() else model_tool.models
-    model_tool.run_fold(
-        file_fold_index,
-        pcs=pcs,
-        nsnps=nsnps,
-        models=models_list,
-        max_workers=inner_model_workers,
-    )
-    return file_fold_index
+            for model in models_list:
+                jobs.append(
+                    {
+                        "config_file": config_file,
+                        "repo_root": str(repo_root),
+                        "file_fold_index": file_fold_index,
+                        "pc": int(pc),
+                        "n_snp": int(n_snp),
+                        "model": model,
+                    }
+                )
+    return jobs
 
 
-def _cv_fold_model_worker(job: Dict[str, object]) -> str:
-    """
-    Worker for ONE fold job. Runs model training only (no GWAS/PCA/model_prep).
-    """
-
-    (
-        config,
-        file_fold_index,
-        gwas_pcs,
-        top_n_snps,
-        models,
-        inner_model_workers,
-    ) = _load_fold_job(job)
+def _cv_model_train_worker(job: Dict[str, object]) -> str:
+    _ensure_repo_root(str(job.get("repo_root", "") or ""))
+    config = read_config(str(job["config_file"]))
     model_tool = ModelConstruction(config)
+    file_fold_index = str(job["file_fold_index"])
+    pc = int(job["pc"])
+    n_snp = int(job["n_snp"])
+    model = str(job["model"])
 
-    pcs = parse_int_list(gwas_pcs) if gwas_pcs.strip() else model_tool.gwas_n_pcs_list
-    nsnps = parse_int_list(top_n_snps) if top_n_snps.strip() else model_tool.top_n_snps_list
-    models_list = [m.strip() for m in models.split(",") if m.strip()] if models.strip() else model_tool.models
-
-    model_tool.run_fold(
-        file_fold_index,
-        pcs=pcs,
-        nsnps=nsnps,
-        models=models_list,
-        max_workers=inner_model_workers,
+    file_fold_npc_nsnp_index = f"{file_fold_index}_{pc}PCs_{n_snp}SNPs"
+    current_dir = os.path.join(model_tool.model_output_dir, file_fold_npc_nsnp_index)
+    train_csv_path = os.path.join(
+        current_dir, f"train_selected_snps_{file_fold_npc_nsnp_index}.csv"
     )
-    return file_fold_index
+    test_csv_path = os.path.join(
+        current_dir, f"test_selected_snps_{file_fold_npc_nsnp_index}.csv"
+    )
+
+    if not (os.path.exists(train_csv_path) and os.path.exists(test_csv_path)):
+        raise FileNotFoundError(f"Missing model input CSVs for {file_fold_npc_nsnp_index}")
+
+    train_data = pd.read_csv(train_csv_path, index_col="taxa")
+    test_data = pd.read_csv(test_csv_path, index_col="taxa")
+
+    train_y = train_data["Phenotype"].values.astype(int)
+    train_X = train_data.drop(columns=["Phenotype"]).values
+    test_y = test_data["Phenotype"].values.astype(int)
+    test_X = test_data.drop(columns=["Phenotype"]).values
+    feature_list = train_data.drop(columns=["Phenotype"]).columns.tolist()
+
+    model_tool.run_machine_learning_and_save_results(
+        (model, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list)
+    )
+    return f"{file_fold_index}_{pc}PCs_{n_snp}SNPs_{model}"
 
 
 class PredictionPipeline(object):
     def __init__(self, configure: Dict[str, str], config_path: Optional[Path] = None):
+        self.config = configure
         self.config_path = config_path
         step_raw = configure.get("step", "0")
         self.steps = _parse_steps(step_raw)
@@ -303,20 +320,21 @@ class PredictionPipeline(object):
             ensure_dir=True,
         )
         # Optional: skip specific samples at alignment/variant stages
-        self.skip_align_samples = _parse_list(configure.get("skip_alignment_samples", ""))
+        self.skip_align_samples = set(_parse_list_ordered(configure.get("skip_alignment_samples", "")))
         # Default variant skip list to alignment skip list if not provided separately
         raw_variant_skip = configure.get("skip_variant_samples", "")
-        self.skip_variant_samples = _parse_list(raw_variant_skip) or set(self.skip_align_samples)
+        self.skip_variant_samples = set(_parse_list_ordered(raw_variant_skip)) or set(self.skip_align_samples)
 
         # Variant calling context (directory only; tool options use VariantCalling defaults
         # unless you add them to configure.txt)
         self.variant_outdir = _resolve_outdir(base_outdir=self.outdir, subdir="02_Variant_Calling", resolve=True)
 
         # Optional VC knobs (leave unset if not present; VariantCalling has sane defaults)
-        self.deepvariant_image = configure.get("deepvariant_image", "google/deepvariant:1.9.0")
+        self.deepvariant_image = configure.get("deepvariant_image", "google/deepvariant:1.10.0-beta")
         self.deepvariant_use_gpu = coerce_bool(configure.get("deepvariant_use_gpu", ""), False)
         self.model_type = configure.get("model_type", "WGS")  # or WES
         self.capture_bed = configure.get("capture_bed", "") or None
+        self.deepvariant_extra_args = (configure.get("deepvariant_extra_args", "") or "").strip()
         self.generate_bed = coerce_bool(configure.get("generate_bed", ""), False)
         self.bed_top_n = _coerce_int("bed_top_n", configure.get("bed_top_n", ""), 0)
         self.bed_chroms = _parse_list_ordered(configure.get("bed_chroms", ""))
@@ -379,13 +397,12 @@ class PredictionPipeline(object):
         self.pred_num_threads = _coerce_int("num_threads", configure.get("num_threads", ""), max(1, min(8, self.threads)))
         self.pred_cv_workers = _coerce_int("cv_workers", configure.get("cv_workers", ""), max(1, min(self.pred_num_splits, self.pred_num_threads)))
 
-        # Inside each fold, keep model training sequential by default (your principle: per split parallel)
+        # Model-level parallelism is handled in the pipeline job queue; keep for compatibility.
         self.pred_inner_model_workers = _coerce_int("inner_model_workers", configure.get("inner_model_workers", ""), 1)
-        step5_mode_raw = (configure.get("step5_mode") or "full").strip().lower()
-        if step5_mode_raw not in {"full", "model_only"}:
-            time_stamp(f"Warning: Unknown step5_mode '{step5_mode_raw}', defaulting to 'full'.")
-            step5_mode_raw = "full"
-        self.pred_step5_mode = step5_mode_raw
+        if "5" in self.steps:
+            self.pred_step5_mode = "full" if "4" in self.steps else "model_only"
+        else:
+            self.pred_step5_mode = "full"
 
     def _require_config_path(self) -> Path:
         if self.config_path is None:
@@ -489,116 +506,127 @@ class PredictionPipeline(object):
         time_stamp(f"Generated capture BED for GLnexus: {out_bed} ({retained} contigs)")
         self.capture_bed = out_bed
 
-    def _cleanup_temp_cache(self) -> None:
-        for base in {self.outdir, self.prediction_outdir}:
-            for name in (".tmp", ".cache"):
-                path = base / name
-                if not path.exists():
-                    continue
-                if not path.is_dir():
-                    time_stamp(f"Warning: Expected directory for cleanup but found file: {path}")
-                    continue
-                try:
-                    shutil.rmtree(path)
-                    time_stamp(f"Removed temp/cache directory: {path}")
-                except Exception as exc:
-                    time_stamp(f"Warning: Failed to remove {path}: {exc}")
-
-    def _run_prediction_eval_script(self, rel_script: str) -> None:
-        
-        repo_root = Path(__file__).resolve().parent
-        cmd = [self.prediction_python, str(repo_root / rel_script), str(self._require_config_path())]
-        subprocess.run(cmd, check=True, cwd=repo_root)
-
     def _run_prediction_gwas_step4(self) -> None:
         """
         Step 4: Run GWAS/PCA per CV fold (train split only).
         """
-        
         fold_configs = self._prepare_prediction_cv_configs(
             create_if_missing=True,
             ensure_bgzip=True,
         )
 
         time_stamp(f"[step4] CV fold configs ready: {len(fold_configs)} folds")
-        runner = PredictionGWASCVStep(fold_configs, self.pred_cv_workers, _cv_gwas_worker)
-        finished = runner.run()
-        time_stamp(f"[step4] Completed folds: {len(finished)}")
+        repo_root = Path(__file__).resolve().parent
+        jobs: List[Dict[str, object]] = []
 
-    def _run_prediction_cv_step5(self) -> None:
-        """
-        Step 5: CV orchestration (fold-level parallel) for model prep + training.
-        """
-        
-        if self.pred_step5_mode == "model_only":
-            cfg_path = self._require_config_path()
-            model_dir = self.prediction_outdir / "Model_result"
-            if not model_dir.exists():
-                raise FileNotFoundError(f"Model_result not found: {model_dir}")
+        for fold_cfg_path in fold_configs:
+            fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
+            config = read_config(fold_cfg["config_file"])
+            file_fold_index = str(fold_cfg["file_fold_index"])
+            gwas_pcs_raw = str(fold_cfg.get("gwas_pcs", "") or "")
+            pca_n_components = CV_preparation.parse_optional_int(fold_cfg.get("pca_n_components"))
 
-            fold_map: Dict[str, Dict[str, Set[int]]] = {}
-            for entry in model_dir.iterdir():
-                if not entry.is_dir():
-                    continue
-                parts = entry.name.split("_")
-                if len(parts) < 3:
-                    continue
-                fold = "_".join(parts[:-2])
-                pc_part = parts[-2]
-                snp_part = parts[-1]
-                if not (pc_part.endswith("PCs") and snp_part.endswith("SNPs")):
-                    continue
-                try:
-                    pc = int(pc_part[:-3])
-                    n_snp = int(snp_part[:-4])
-                except ValueError:
-                    continue
-                if fold not in fold_map:
-                    fold_map[fold] = {"pcs": set(), "snps": set()}
-                fold_map[fold]["pcs"].add(pc)
-                fold_map[fold]["snps"].add(n_snp)
+            train_samples = CV_preparation.read_samples_file(Path(fold_cfg["train_samples_file"]))
+            if not train_samples:
+                raise ValueError(f"No train samples found in {fold_cfg['train_samples_file']}")
 
-            if not fold_map:
-                raise ValueError(f"No model input directories found under {model_dir}")
+            npz_path = _prepare_fold_numeric_npz(
+                config,
+                file_fold_index=file_fold_index,
+                train_samples=train_samples,
+                prediction_outdir=self.prediction_outdir,
+            )
 
-            jobs = []
-            for fold in sorted(fold_map):
-                pcs = sorted(fold_map[fold]["pcs"])
-                nsnps = sorted(fold_map[fold]["snps"])
+            pcs = parse_int_list(gwas_pcs_raw) if gwas_pcs_raw.strip() else _default_gwas_pcs(config)
+            if not pcs:
+                pcs = [0]
+
+            for pc in pcs:
                 jobs.append(
                     {
-                        "config_file": str(cfg_path),
-                        "repo_root": str(Path(__file__).resolve().parent),
-                        "file_fold_index": fold,
-                        "gwas_pcs": ",".join(str(p) for p in pcs),
-                        "top_n_snps": ",".join(str(n) for n in nsnps),
-                        "models": self.pred_models,
-                        "inner_model_workers": int(self.pred_inner_model_workers),
+                        "config_file": str(Path(fold_cfg["config_file"]).expanduser()),
+                        "repo_root": str(repo_root),
+                        "file_fold_index": file_fold_index,
+                        "npz_path": str(npz_path),
+                        "gwas_pc": int(pc),
+                        "pca_n_components": pca_n_components,
                     }
                 )
 
-            time_stamp(f"[step5] mode=model_only: {len(jobs)} folds discovered under {model_dir}")
+        time_stamp(f"[step4] GWAS jobs queued: {len(jobs)}")
+        finished: List[str] = []
+        with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
+            futs = [ex.submit(_cv_gwas_pc_worker, j) for j in jobs]
+            for fut in as_completed(futs):
+                finished.append(fut.result())
+        time_stamp(f"[step4] Completed jobs: {len(finished)}")
+
+    def _run_prediction_cv_step5(self) -> None:
+        """
+        Step 5: CV orchestration (pipeline-level jobs) for model prep + training.
+        """
+        repo_root = Path(__file__).resolve().parent
+
+        if self.pred_step5_mode == "model_only":
+            cv_config_dir = self.prediction_outdir / "cv_configs"
+            if not cv_config_dir.exists():
+                raise FileNotFoundError(
+                    f"cv_configs not found: {cv_config_dir} (run step 4 or generate fold configs)"
+                )
+            fold_config_paths = sorted(cv_config_dir.glob("fold_*_config.txt"))
+            if not fold_config_paths:
+                raise FileNotFoundError(
+                    f"No fold config files found under {cv_config_dir} (run step 4 or generate fold configs)"
+                )
+
+            jobs: List[Dict[str, object]] = []
+            for fold_cfg_path in fold_config_paths:
+                jobs.extend(
+                    _build_model_jobs_for_fold(
+                        fold_cfg_path,
+                        prepare=False,
+                        repo_root=repo_root,
+                    )
+                )
+
+            time_stamp(f"[step5] mode=model_only: {len(jobs)} model jobs queued from {cv_config_dir}")
+            if not jobs:
+                time_stamp("[step5] No model jobs to run.")
+                return
 
             finished: List[str] = []
             with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
-                futs = [ex.submit(_cv_fold_model_worker, j) for j in jobs]
+                futs = [ex.submit(_cv_model_train_worker, j) for j in jobs]
                 for fut in as_completed(futs):
                     finished.append(fut.result())
 
-            time_stamp(f"[step5] Completed folds: {len(finished)}")
+            time_stamp(f"[step5] Completed jobs: {len(finished)}")
             return
 
         fold_configs = self._prepare_prediction_cv_configs(create_if_missing=False)
 
         time_stamp(f"[step5] CV fold configs ready: {len(fold_configs)} folds")
-        runner = PredictionModelCVStep(
-            fold_configs,
-            self.pred_cv_workers,
-            self.pred_inner_model_workers,
-            _cv_model_prep_worker,
-        )
-        finished = runner.run()
-        time_stamp(f"[step5] Completed folds: {len(finished)}")
+        jobs = []
+        for fold_cfg_path in fold_configs:
+            jobs.extend(
+                _build_model_jobs_for_fold(
+                    fold_cfg_path,
+                    prepare=True,
+                    repo_root=repo_root,
+                )
+            )
+
+        time_stamp(f"[step5] Model jobs queued: {len(jobs)}")
+        if not jobs:
+            time_stamp("[step5] No model jobs to run.")
+            return
+
+        finished: List[str] = []
+        with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
+            futs = [ex.submit(_cv_model_train_worker, j) for j in jobs]
+            for fut in as_completed(futs):
+                finished.append(fut.result())
+        time_stamp(f"[step5] Completed jobs: {len(finished)}")
 
         # Summarize metrics (replicates cat_result behavior; avoids re-running training)
         model_dir = self.prediction_outdir / "Model_result"
@@ -687,36 +715,33 @@ class PredictionPipeline(object):
             return
         if step_id == "4":
             time_stamp("[eva4] Manhattan/QQ plots")
-            self._run_prediction_eval_script("Evaluation/gwas_manhattan_plot.py")
+            GWASManhattanPlotRunner(self.config).run()
             return
         if step_id == "5":
             time_stamp("[eva5] Prediction ROC/AUC plots")
-            self._run_prediction_eval_script("Evaluation/prediction_roc_plot.py")
+            PredictionRocPlotRunner(self.config).run()
             return
         raise ValueError(f"Unknown evaluation step: {step_id}")
 
     def run(self):
         time_stamp("Starting Digital Breeding Prediction Pipeline")
-        try:
-            steps_to_run = self.steps - {"0"}
-            if steps_to_run or self.eva_steps:
-                self._require_config_path()
-            if not steps_to_run and not self.eva_steps:
-                print("No steps selected.")
-                return
-            if not steps_to_run and self.eva_steps:
-                print("Evaluation-only mode.")
+        steps_to_run = self.steps - {"0"}
+        if steps_to_run or self.eva_steps:
+            self._require_config_path()
+        if not steps_to_run and not self.eva_steps:
+            print("No steps selected.")
+            return
+        if not steps_to_run and self.eva_steps:
+            print("Evaluation-only mode.")
 
-            # Evaluation step 0 can run before any analysis
-            self._run_eval_step("0")
+        # Evaluation step 0 can run before any analysis
+        self._run_eval_step("0")
 
-            for step_id in ("1", "2", "3", "4", "5"):
-                if step_id in steps_to_run:
-                    self._run_core_step(step_id)
-                self._run_eval_step(step_id)
-            time_stamp("Pipeline complete")
-        finally:
-            self._cleanup_temp_cache()
+        for step_id in ("1", "2", "3", "4", "5"):
+            if step_id in steps_to_run:
+                self._run_core_step(step_id)
+            self._run_eval_step(step_id)
+        time_stamp("Pipeline complete")
 
 
 def main():

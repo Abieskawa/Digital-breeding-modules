@@ -97,7 +97,6 @@ prediction_python= # Optional: override python path for step 5 (e.g., /opt/conda
 species_name=Oreochromis_niloticus # Name of target species for name/title tag
 phenotype_column=Group  # Or any other phenotype column you are using #Chlorosis_10
 data_type=binary # binary, multiclass, regression
-oversampling=True # Over sampling with SMOTE if data is unbalanced
 
 
 # Top N SNPs settings

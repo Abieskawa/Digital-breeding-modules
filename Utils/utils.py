@@ -1,6 +1,7 @@
 # Utils/utils.py
 import gzip
 import os
+import numpy as np
 import shutil
 import subprocess as sbp
 import sys
@@ -61,6 +62,24 @@ def parse_int_list(raw: str) -> List[int]:
         if chunk.strip():
             parts.extend([p for p in chunk.split(" ") if p.strip()])
     return [int(p) for p in parts]
+
+def _open_text_maybe_gz(path: str):
+    """
+    Open a text file that may be plain or gzipped, based on magic header.
+    """
+    with open(path, "rb") as f:
+        sig = f.read(2)
+    opener = gzip.open if sig == b"\x1f\x8b" else open
+    return opener(path, "rt")
+
+def _save_numeric_npz(df_numeric, out_npz: str) -> None:
+    os.makedirs(os.path.dirname(out_npz) or ".", exist_ok=True)
+    np.savez_compressed(
+        out_npz,
+        genotype=df_numeric.to_numpy(dtype=np.float32, copy=False),
+        samples=np.array(df_numeric.index.astype(str)),
+        snps=np.array(df_numeric.columns.astype(str)),
+    )
 
 def coerce_bool(raw, default: bool) -> bool:
     if raw is None:

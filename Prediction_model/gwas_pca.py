@@ -24,9 +24,8 @@ Notes:
 """
 import os
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -209,7 +208,10 @@ class GWAS_PCA:
             principal_df, explained_variance_ratio = self.perform_pca(train_numeric, n_components=n_components)
             # Save explained variance (optional)
             try:
-                out_csv = os.path.join(self.pca_scree_output_dir, f'explained_variance_{file_fold_index}.csv')
+                out_suffix = file_fold_index
+                if gwas_pcs_override and len(gwas_pcs_list) == 1:
+                    out_suffix = f"{file_fold_index}_{gwas_pcs_list[0]}PCs"
+                out_csv = os.path.join(self.pca_scree_output_dir, f'explained_variance_{out_suffix}.csv')
                 pd.DataFrame({"explained_variance_ratio": explained_variance_ratio}).to_csv(out_csv, index=False)
             except Exception:
                 pass
@@ -231,7 +233,8 @@ def run_gwas_pca_from_config(
     gwas_pcs_override: str = "",
     pca_components_override: Optional[int] = None,
 ) -> None:
-    from Prediction_model.snp_numeric_transformer import SNP_numerical, _save_numeric_npz
+    from Prediction_model.snp_numeric_transformer import SNP_numerical
+    from Utils.utils import _save_numeric_npz
 
     vcf_path = Path(vcf_path).expanduser().resolve()
     pheno_path = Path(pheno_path).expanduser().resolve()
@@ -291,21 +294,3 @@ def run_gwas_pca_from_config(
         gwas_pcs_override=gwas_pcs_override,
         pca_components_override=pca_components,
     )
-
-
-class PredictionGWASCVStep:
-    def __init__(self, fold_configs: List[Path], max_workers: int, worker: Callable[[Dict[str, object]], str]):
-        self.fold_configs = fold_configs
-        self.max_workers = max_workers
-        self.worker = worker
-
-    def run(self) -> List[str]:
-        finished: List[str] = []
-        with ProcessPoolExecutor(max_workers=int(self.max_workers)) as ex:
-            futs = [
-                ex.submit(self.worker, {"fold_config": str(cfg)})
-                for cfg in self.fold_configs
-            ]
-            for fut in as_completed(futs):
-                finished.append(fut.result())
-        return finished

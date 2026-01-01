@@ -17,7 +17,6 @@ Cross-validation orchestration is intentionally NOT implemented here
 (you said CV stays in the main run_prediction_pipeline.py).
 """
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Dict, List
 
@@ -25,7 +24,7 @@ import numpy as np
 import pandas as pd
 import shap
 import matplotlib.pyplot as plt
-from Utils.utils import _resolve_outdir, parse_int_list, parallel_process
+from Utils.utils import _resolve_outdir, parse_int_list
 
 from sklearn import metrics, ensemble, svm
 from sklearn.metrics import confusion_matrix
@@ -37,7 +36,6 @@ import torch.optim as optim
 import torch.nn.init as init
 from torch.utils.data import DataLoader, TensorDataset
 
-from imblearn.over_sampling import SMOTE
 
 try:
     from sklearnex import patch_sklearn, unpatch_sklearn
@@ -76,7 +74,6 @@ class ModelConstruction:
         self.species_name = self.config.get('species_name')
         self.phenotype_column = self.config.get('phenotype_column', 'Phenotype')
         self.data_type = self.config.get('data_type', 'binary')
-        self.oversampling = self.config.get('oversampling', 'True').lower() == 'true'
 
         self.output_dir = _resolve_outdir(
             self.config,
@@ -351,19 +348,11 @@ class ModelConstruction:
                 test_X = test_data.drop(columns=['Phenotype']).values
                 feature_list = train_data.drop(columns=['Phenotype']).columns.tolist()
 
-                if self.oversampling:
-                    smt = SMOTE()
-                    train_X, train_y = smt.fit_resample(train_X, train_y)
-
                 for model_name in models:
                     models_list.append((model_name, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list))
 
-        parallel_process(
-            models_list,
-            self.run_machine_learning_and_save_results,
-            max_workers=max_workers,
-            raise_on_error=True,
-        )
+        for item in models_list:
+            self.run_machine_learning_and_save_results(item)
 
     def cat_result(self):
         result_files = [f for f in os.listdir(self.model_output_dir) if f.endswith('.csv')]
@@ -401,17 +390,13 @@ class PredictionModelCVStep:
 
     def run(self) -> List[str]:
         finished: List[str] = []
-        with ProcessPoolExecutor(max_workers=int(self.max_workers)) as ex:
-            futs = [
-                ex.submit(
-                    self.worker,
+        for cfg in self.fold_configs:
+            finished.append(
+                self.worker(
                     {
                         "fold_config": str(cfg),
                         "inner_model_workers": int(self.inner_model_workers),
-                    },
+                    }
                 )
-                for cfg in self.fold_configs
-            ]
-            for fut in as_completed(futs):
-                finished.append(fut.result())
+            )
         return finished

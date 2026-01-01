@@ -43,10 +43,11 @@ class VariantCalling:
 
         self.variant_outdir.mkdir(parents=True, exist_ok=True)
 
-        self.deepvariant_image = getattr(args, 'deepvariant_image', 'google/deepvariant:1.9.0')
+        self.deepvariant_image = getattr(args, 'deepvariant_image', 'google/deepvariant:1.10.0-beta')
         self.deepvariant_use_gpu = coerce_bool(getattr(args, 'deepvariant_use_gpu', None), False)
         self._deepvariant_use_gpu_supported = None
         self.model_type        = getattr(args, 'model_type', 'WGS')
+        self.deepvariant_extra_args = str(getattr(args, 'deepvariant_extra_args', '') or '').strip()
         cap                    = getattr(args, 'capture_bed', None)
         self.capture_bed       = Path(cap).resolve() if cap else None
 
@@ -113,6 +114,7 @@ class VariantCalling:
         gpu_arg = ""
         if self.deepvariant_use_gpu and self._deepvariant_supports_use_gpu(deepvariant_bin):
             gpu_arg = "--use_gpu"
+        extra_args = f"{self.deepvariant_extra_args} " if self.deepvariant_extra_args else ""
         cmd = (
             f"{env_prefix} {deepvariant_bin} "
             f"--model_type={self.model_type} "
@@ -120,6 +122,7 @@ class VariantCalling:
             f"--reads={bam_dir}/{bam_path.name} "
             f"{regions_arg} "
             f"{gpu_arg} "
+            f"{extra_args}"
             f"--output_vcf={self.variant_outdir}/{v_out.name} "
             f"--output_gvcf={self.variant_outdir}/{g_out.name} "
             f"--num_shards={self.threads}"

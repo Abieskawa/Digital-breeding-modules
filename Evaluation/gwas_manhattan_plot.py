@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-import argparse
 import os
-import sys
-from pathlib import Path
+from typing import Dict, List
+
+from Prediction_model.prediction_model import SNPPredictionModelTool
+from Utils.utils import parallel_process
 
 
-def _collect_plot_targets(gwas_dir: str, phenotype_column: str):
-    targets = []
+def _collect_plot_targets(gwas_dir: str, phenotype_column: str) -> List[str]:
+    targets: List[str] = []
     if not os.path.isdir(gwas_dir):
         return targets
     for name in sorted(os.listdir(gwas_dir)):
@@ -21,31 +22,20 @@ def _collect_plot_targets(gwas_dir: str, phenotype_column: str):
     return targets
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Plot Manhattan/QQ for BLINK GWAS results")
-    parser.add_argument("config_file", help="Path to the configuration file")
-    args = parser.parse_args()
+class GWASManhattanPlotRunner:
+    def __init__(self, config: Dict[str, str]):
+        self.config = config
 
-    repo_root = Path(__file__).resolve().parents[1]
-    sys.path.insert(0, str(repo_root))
+    def run(self) -> None:
+        tools = SNPPredictionModelTool(self.config)
 
-    from Prediction_model.prediction_model import SNPPredictionModelTool
-    from Utils.utils import read_config, parallel_process
+        targets = _collect_plot_targets(tools.gwas_output_dir, tools.phenotype_column)
+        if not targets:
+            print(f"No GWAS results found under {tools.gwas_output_dir}")
+            return
 
-    config = read_config(args.config_file)
-    tools = SNPPredictionModelTool(config)
-
-    targets = _collect_plot_targets(tools.gwas_output_dir, tools.phenotype_column)
-    if not targets:
-        print(f"No GWAS results found under {tools.gwas_output_dir}")
-        return
-
-    parallel_process(
-        targets,
-        tools.plot_manhattan_and_qq,
-        max_workers=tools.num_threads,
-    )
-
-
-if __name__ == "__main__":
-    main()
+        parallel_process(
+            targets,
+            tools.plot_manhattan_and_qq,
+            max_workers=tools.num_threads,
+        )

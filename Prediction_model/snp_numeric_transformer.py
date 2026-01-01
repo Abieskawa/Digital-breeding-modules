@@ -16,25 +16,12 @@ It supports TWO modes that match your intended pipeline flow:
 
 Unrelated parts (PCA, GWAS running, model training, CV loops) are NOT implemented here.
 """
-import gzip
 import os
 from typing import List
 
-import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
-from Utils.utils import _resolve_outdir, parse_int_list
-
-
-def _open_text_maybe_gz(path: str):
-    """
-    Open plain text or bgzip/gzip VCF transparently.
-    """
-    with open(path, "rb") as f:
-        sig = f.read(2)
-    if sig == b"\x1f\x8b":  # gzip magic
-        return gzip.open(path, "rt")
-    return open(path, "rt")
+from Utils.utils import _resolve_outdir, parse_int_list, _open_text_maybe_gz
 
 
 class SNP_numerical:
@@ -78,6 +65,30 @@ class SNP_numerical:
                     return line.strip().split('\t')
         raise ValueError("VCF header not found.")
 
+    @staticmethod
+    def _to_gt(x):
+        if pd.isna(x):
+            return np.nan
+        s = str(x)
+        if ":" in s:
+            s = s.split(":", 1)[0]
+        return s
+
+    @staticmethod
+    def _map_gt(gt):
+        if pd.isna(gt):
+            return np.nan
+        if gt in ('0/0', '0|0'):
+            return 1
+        if gt in ('0/1', '1/0', '0|1', '1|0'):
+            return 2
+        if gt in ('1/1', '1|1'):
+            return 3
+        if gt in ('./.', '.|.'):
+            return np.nan
+        # Keep as-is (will fail cast if truly non-numeric); matches original behavior
+        return gt
+
     def vcf_to_dataframe(self, vcf_file: str) -> pd.DataFrame:
         header = self.get_vcf_header(vcf_file)
         # pandas can read gz if compression='infer' and extension is .gz, but we also allow magic detection above
@@ -95,29 +106,9 @@ class SNP_numerical:
         Convert genotype strings to numeric values and fill NA using median imputation.
         Robust to VCF sample fields like "0/1:DP:..." by using only the GT part.
         """
-        def _to_gt(x):
-            if pd.isna(x):
-                return np.nan
-            s = str(x)
-            if ":" in s:
-                s = s.split(":", 1)[0]
-            return s
-
-        def _map_gt(gt):
-            if pd.isna(gt):
-                return np.nan
-            if gt in ('0/0', '0|0'):
-                return 1
-            if gt in ('0/1', '1/0', '0|1', '1|0'):
-                return 2
-            if gt in ('1/1', '1|1'):
-                return 3
-            if gt in ('./.', '.|.'):
-                return np.nan
-            # Keep as-is (will fail cast if truly non-numeric); matches original behavior
-            return gt
-
-        genotype_numeric_df = genotype_df.apply(lambda col: col.map(lambda x: _map_gt(_to_gt(x))))
+        genotype_numeric_df = genotype_df.apply(
+            lambda col: col.map(lambda x: self._map_gt(self._to_gt(x)))
+        )
         genotype_numeric_df = genotype_numeric_df.astype(float)
 
         imputer = SimpleImputer(strategy='median')
@@ -145,11 +136,6 @@ class SNP_numerical:
         test_df: pd.DataFrame,
         top_n_snps: int = 10
     ) -> List[str]:
-        """
-        This is directly adapted from the reference script
-        (select_markers_and_prepare_data_for_model_construction),
-        except it is now located in Step 1 because it is "SNP -> numeric + formatting".
-        """
         current_dir = os.path.join(self.gwas_output_dir, file_fold_npc_index)
         p_value_file = os.path.join(current_dir, f'train_{file_fold_npc_index}_{self.phenotype_column}_GWAS_result.txt')
         vcf_file = os.path.join(current_dir, f'train_{file_fold_npc_index}.vcf')
@@ -184,12 +170,3 @@ class SNP_numerical:
 
         return top_snps
 
-
-def _save_numeric_npz(df_numeric: pd.DataFrame, out_npz: str) -> None:
-    os.makedirs(os.path.dirname(out_npz) or ".", exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-        genotype=df_numeric.to_numpy(dtype=np.float32, copy=False),
-        samples=np.array(df_numeric.index.astype(str)),
-        snps=np.array(df_numeric.columns.astype(str)),
-    )

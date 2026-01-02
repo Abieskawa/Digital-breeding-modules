@@ -10,7 +10,6 @@ Inputs:
 
 Outputs:
   - Metrics CSVs (per model/config)
-  - SHAP plots
   - Saved models (NEW) under output_dir/Model_result/Saved_models/
 
 Cross-validation orchestration is intentionally NOT implemented here
@@ -22,8 +21,6 @@ from typing import Callable, Dict, List
 
 import numpy as np
 import pandas as pd
-import shap
-import matplotlib.pyplot as plt
 from Utils.utils import _resolve_outdir, parse_int_list
 
 from sklearn import metrics, ensemble, svm
@@ -82,16 +79,6 @@ class ModelConstruction:
             ensure_dir=True,
         )
 
-        self.shap_output_dir = _resolve_outdir(
-            base_outdir=self.output_dir,
-            subdir="Shap_dir",
-            ensure_dir=True,
-        )
-        self.auc_plot_output_dir = _resolve_outdir(
-            base_outdir=self.output_dir,
-            subdir="AUC_dir",
-            ensure_dir=True,
-        )
         self.model_output_dir = _resolve_outdir(
             base_outdir=self.output_dir,
             subdir="Model_result",
@@ -253,52 +240,8 @@ class ModelConstruction:
         tn, fp, fn, tp = confusion_matrix(test_y, predictions).ravel()
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
 
-        # SHAP values
-        if model_name in ['RandomForest', 'XGBoost']:
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(test_X)
-            if model_name == 'RandomForest':
-                shap_values_to_plot = shap_values[:, :, 1]
-            else:
-                shap_values_to_plot = shap_values
-
-        elif model_name == "MLP":
-            model_cpu = model.cpu()
-            X_train_cpu = torch.tensor(train_X, dtype=torch.float32)
-            X_test_cpu = torch.tensor(test_X, dtype=torch.float32)
-
-            explainer = shap.GradientExplainer(model_cpu, X_train_cpu)
-            shap_values = explainer.shap_values(X_test_cpu)
-            shap_values_to_plot = np.squeeze(shap_values)
-
-            model.to(self.device)
-
-        else:
-            explainer = shap.KernelExplainer(model.predict_proba, train_X)
-            shap_values = explainer.shap_values(test_X)
-            shap_values_to_plot = shap_values[:, :, 1]
-
         if unpatch_sklearn is not None:
             unpatch_sklearn()
-
-        # Save SHAP top10
-        df_shap_values = pd.DataFrame(shap_values_to_plot, columns=feature_list)
-        df_feature_importance = pd.DataFrame(columns=['feature', 'importance'])
-        for col in df_shap_values.columns:
-            importance = df_shap_values[col].abs().mean()
-            df_feature_importance.loc[len(df_feature_importance)] = [col, importance]
-            df_feature_importance = df_feature_importance.sort_values('importance', ascending=False)
-
-        df_feature_importance_file = os.path.join(self.model_output_dir, f'ShapTop10_{model_name}_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.csv')
-        df_feature_importance.to_csv(df_feature_importance_file, index=False)
-
-        # SHAP summary plot
-        plt.figure()
-        shap.summary_plot(shap_values_to_plot, test_X, feature_names=feature_list, show=False)
-        plt.title(f'{model_name} SHAP Summary Plot (Fold {file_index},PC{n_pcs},{n_snps}SNPs)')
-        shap_plot = os.path.join(self.shap_output_dir, f'{model_name}_SHAP_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.png')
-        plt.savefig(shap_plot)
-        plt.close()
 
         metrics_dict = {
             'model_name': model_name,
@@ -367,12 +310,6 @@ class ModelConstruction:
         sorted_df.to_csv(os.path.join(self.output_dir, 'model_evaluation_results_all.csv'), index=False)
         summarized_df.to_csv(os.path.join(self.output_dir, 'model_evaluation_results_mean.csv'), index=False)
         print("Summary file saved")
-
-    def plot_performance_comparison(self):
-        from Prediction_model.prediction_model import SNPPredictionModelTool
-
-        tool = SNPPredictionModelTool(self.config)
-        tool.plot_performance_comparison()
 
 
 class PredictionModelCVStep:

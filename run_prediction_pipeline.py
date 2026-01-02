@@ -13,8 +13,8 @@ from Evaluation.contamination import ContaminationEvaluator
 from Evaluation.evaluate_mapping import MappingYieldEvaluator
 from Evaluation.fastq_qc import FastQCEvaluator
 from Evaluation.variant_circos import VariantCircosEvaluator
-from Evaluation.gwas_manhattan_plot import GWASManhattanPlotRunner
-from Evaluation.prediction_roc_plot import PredictionRocPlotRunner
+from Evaluation.gwas_pca_eval import GWASPCAEvaluator
+from Evaluation.roc_shap_eval import RocShapEvaluator
 from Utils.bed_generator import build_capture_bed
 from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool, _save_numeric_npz
 from Utils.cv_preparation import CV_preparation
@@ -83,6 +83,21 @@ def _ensure_repo_root(repo_root: Optional[str]) -> None:
     root = str(Path(repo_root))
     if root and root not in sys.path:
         sys.path.insert(0, root)
+
+
+def _ensure_env_tmpdir() -> None:
+    """
+    Ensure any explicitly-configured temp directories exist.
+    This avoids failures in tools that require TMPDIR to be present.
+    """
+    for key in ("TMPDIR", "TEMP", "TMP"):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        try:
+            Path(raw).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"Warning: Unable to create {key} directory {raw}: {exc}")
 
 
 def _default_gwas_pcs(config: Dict[str, str]) -> List[int]:
@@ -715,11 +730,11 @@ class PredictionPipeline(object):
             return
         if step_id == "4":
             time_stamp("[eva4] Manhattan/QQ plots")
-            GWASManhattanPlotRunner(self.config).run()
+            GWASPCAEvaluator(self.config).run()
             return
         if step_id == "5":
             time_stamp("[eva5] Prediction ROC/AUC plots")
-            PredictionRocPlotRunner(self.config).run()
+            RocShapEvaluator(self.config).run()
             return
         raise ValueError(f"Unknown evaluation step: {step_id}")
 
@@ -748,6 +763,7 @@ def main():
     parser = argparse.ArgumentParser(description="Digital Breeding Prediction Pipeline")
     parser.add_argument('--config_file', type=str, required=True, help='Path to the configuration file.')
     args = parser.parse_args()
+    _ensure_env_tmpdir()
     config_path = Path(args.config_file).resolve()
     configure = read_config(config_path)
     pipeline = PredictionPipeline(configure, config_path=config_path)

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from pycirclize import Circos
 
-from Utils.utils import _append_log_line, call_log, time_stamp, _resolve_outdir, setup_local_env
+from Utils.utils import _append_log_line, call_log, time_stamp, _resolve_outdir, setup_eval_env
 
 
 def _format_bp(x: int) -> str:
@@ -241,12 +241,33 @@ def vcf_positions(vcf: Path) -> Dict[str, List[int]]:
     return pos
 
 
+def _load_chromosome_recode(chromosome_csv_path: Optional[Path]) -> Dict[str, str]:
+    if not chromosome_csv_path:
+        return {}
+    path = Path(chromosome_csv_path)
+    if not path.exists():
+        return {}
+    try:
+        mapping = pd.read_csv(path)
+    except Exception:
+        return {}
+    if "OriginalName" not in mapping.columns or "Label" not in mapping.columns:
+        return {}
+    return dict(
+        zip(
+            mapping["OriginalName"].astype(str),
+            mapping["Label"].astype(str),
+        )
+    )
+
+
 def prepare_circos_reference(
     ref_fasta: Optional[Path],
     gff: Optional[Path],
     gff_biotype: Optional[str],
     target_seq: Optional[int],
     allowed_chroms: Optional[Set[str]],
+    recode_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[bool, Dict[str, int], Dict[str, List[int]], Dict[str, str], List[Tuple[str, int]]]:
     if not (ref_fasta and Path(ref_fasta).exists()):
         return False, {}, {}, {}, []
@@ -262,7 +283,18 @@ def prepare_circos_reference(
     if not ordered:
         return False, {}, {}, {}, []
 
-    rename_map = {name: f"chr{i+1}" for i, (name, _) in enumerate(ordered)}
+    used_labels: Set[str] = set()
+    rename_map: Dict[str, str] = {}
+    for i, (name, _) in enumerate(ordered):
+        candidate = recode_map.get(name) if recode_map else None
+        if not candidate or candidate in used_labels:
+            candidate = f"chr{i+1}"
+        suffix = 1
+        while candidate in used_labels:
+            suffix += 1
+            candidate = f"chr{i+1}_{suffix}"
+        rename_map[name] = candidate
+        used_labels.add(candidate)
     fasta_lens = {rename_map[name]: length for name, length in ordered}
 
     gene_raw = gff_gene_starts(gff, gff_biotype) if gff and Path(gff).exists() else defaultdict(list)
@@ -288,17 +320,16 @@ class VariantCircosEvaluator:
     Step 3: Variant stats + Circos (gene + variant density).
     """
 
-    def _setup_local_env(self) -> None:
-        self.tmp_dir, self.mpl_config_dir = setup_local_env(self.outdir)
-
     def __init__(self, args):
         self.threads   = int(getattr(args, "threads", 1))
         self.outdir    = _resolve_outdir(base_outdir=getattr(args, "outdir", "."), resolve=True)
         self.variant_dir = _resolve_outdir(base_outdir=getattr(args, "variant_outdir", self.outdir), resolve=True)
         self.ref_fasta = Path(getattr(args, "ref_fasta", "")).expanduser().resolve() if getattr(args, "ref_fasta", None) else None
         self.gff       = Path(getattr(args, "gff", "")).expanduser().resolve() if getattr(args, "gff", None) else None
+        chrom_raw = (getattr(args, "chromosome_csv_path", "") or "").strip()
+        self.chromosome_csv_path = Path(chrom_raw).expanduser().resolve() if chrom_raw else None
 
-        self._setup_local_env()
+        self.tmp_dir, self.mpl_config_dir, self.report_dir = setup_eval_env(self.outdir)
 
         self.gff_biotype   = getattr(args, "gff_biotype", None)
         self.circos_window = _optional_int(getattr(args, "circos_window", None), default=10000, none_if_blank=False) or 10000
@@ -309,13 +340,7 @@ class VariantCircosEvaluator:
         except Exception:
             self.target_seq  = 0
 
-        self.report_dir = _resolve_outdir(
-            base_outdir=self.outdir,
-            subdir="evaluation",
-            resolve=True,
-            ensure_dir=True,
-        )
-        (self.report_dir / "logs").mkdir(parents=True, exist_ok=True)
+        # report_dir already created by setup_eval_env
 
     @staticmethod
     def _bcftools_stats_one(vcf: Path, stats_out: Path) -> Optional[Dict]:
@@ -335,12 +360,14 @@ class VariantCircosEvaluator:
         allowed_chroms = set(self.circos_chroms) if self.circos_chroms else None
         max_chroms = self.target_seq if self.target_seq and self.target_seq > 0 else None
 
+        recode_map = _load_chromosome_recode(self.chromosome_csv_path)
         do_circos, fasta_lens, gene_starts, rename_map, contig_order = prepare_circos_reference(
             ref_fasta=self.ref_fasta,
             gff=self.gff,
             gff_biotype=self.gff_biotype,
             target_seq=max_chroms,
             allowed_chroms=allowed_chroms,
+            recode_map=recode_map,
         )
         if do_circos and not contig_order:
             time_stamp("[variants] circos skipped: no contigs after filtering")

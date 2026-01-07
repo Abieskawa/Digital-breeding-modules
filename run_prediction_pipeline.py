@@ -14,7 +14,12 @@ from Evaluation.evaluate_mapping import MappingYieldEvaluator
 from Evaluation.fastq_qc import FastQCEvaluator
 from Evaluation.variant_circos import VariantCircosEvaluator
 from Evaluation.gwas_pca_eval import GWASPCAEvaluator
-from Evaluation.roc_shap_eval import RocShapEvaluator
+from Evaluation.roc_shap_eval import (
+    RocShapEvaluator,
+    _generate_shap_output_for_artifact,
+    _parse_model_artifact,
+    _plot_performance_comparison,
+)
 from Utils.bed_generator import build_capture_bed
 from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool, _save_numeric_npz
 from Utils.cv_preparation import CV_preparation
@@ -100,6 +105,18 @@ def _ensure_env_tmpdir() -> None:
             print(f"Warning: Unable to create {key} directory {raw}: {exc}")
 
 
+def _set_thread_env(num_threads: int) -> None:
+    threads = max(1, int(num_threads))
+    for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = str(threads)
+    try:
+        import torch
+        torch.set_num_threads(threads)
+        torch.set_num_interop_threads(threads)
+    except Exception:
+        pass
+
+
 def _default_gwas_pcs(config: Dict[str, str]) -> List[int]:
     pcs = (
         parse_int_list(config.get("gwas_n_pcs_list", ""))
@@ -133,6 +150,9 @@ def _prepare_fold_numeric_npz(
 def _cv_gwas_pc_worker(job: Dict[str, object]) -> str:
     _ensure_repo_root(str(job.get("repo_root", "") or ""))
     config = read_config(str(job["config_file"]))
+    vcf_file_path = job.get("vcf_file_path")
+    if vcf_file_path and not config.get("vcf_file_path"):
+        config["vcf_file_path"] = str(vcf_file_path)
     gwas_tool = GWAS_PCA(config)
     file_fold_index = str(job["file_fold_index"])
     gwas_pc = str(job["gwas_pc"])
@@ -152,9 +172,12 @@ def _build_model_jobs_for_fold(
     *,
     prepare: bool,
     repo_root: Path,
+    vcf_file_path: Optional[str] = None,
 ) -> List[Dict[str, object]]:
     fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
     config = read_config(fold_cfg["config_file"])
+    if vcf_file_path and not config.get("vcf_file_path"):
+        config["vcf_file_path"] = str(vcf_file_path)
     file_fold_index = str(fold_cfg["file_fold_index"])
     gwas_pcs = str(fold_cfg.get("gwas_pcs", "") or "")
     top_n_snps = str(fold_cfg.get("top_n_snps", "") or "")
@@ -217,38 +240,49 @@ def _build_model_jobs_for_fold(
 
 def _cv_model_train_worker(job: Dict[str, object]) -> str:
     _ensure_repo_root(str(job.get("repo_root", "") or ""))
+    model_threads = int(job.get("model_threads") or 1)
+    _set_thread_env(model_threads)
     config = read_config(str(job["config_file"]))
+    if model_threads and not config.get("model_threads"):
+        config["model_threads"] = str(model_threads)
     model_tool = ModelConstruction(config)
     file_fold_index = str(job["file_fold_index"])
     pc = int(job["pc"])
     n_snp = int(job["n_snp"])
     model = str(job["model"])
 
-    file_fold_npc_nsnp_index = f"{file_fold_index}_{pc}PCs_{n_snp}SNPs"
-    current_dir = os.path.join(model_tool.model_output_dir, file_fold_npc_nsnp_index)
-    train_csv_path = os.path.join(
-        current_dir, f"train_selected_snps_{file_fold_npc_nsnp_index}.csv"
+    train_X, train_y, test_X, test_y, feature_list = model_tool._load_fold_data(
+        file_fold_index,
+        pc,
+        n_snp,
     )
-    test_csv_path = os.path.join(
-        current_dir, f"test_selected_snps_{file_fold_npc_nsnp_index}.csv"
-    )
-
-    if not (os.path.exists(train_csv_path) and os.path.exists(test_csv_path)):
-        raise FileNotFoundError(f"Missing model input CSVs for {file_fold_npc_nsnp_index}")
-
-    train_data = pd.read_csv(train_csv_path, index_col="taxa")
-    test_data = pd.read_csv(test_csv_path, index_col="taxa")
-
-    train_y = train_data["Phenotype"].values.astype(int)
-    train_X = train_data.drop(columns=["Phenotype"]).values
-    test_y = test_data["Phenotype"].values.astype(int)
-    test_X = test_data.drop(columns=["Phenotype"]).values
-    feature_list = train_data.drop(columns=["Phenotype"]).columns.tolist()
 
     model_tool.run_machine_learning_and_save_results(
         (model, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list)
     )
     return f"{file_fold_index}_{pc}PCs_{n_snp}SNPs_{model}"
+
+
+def _gwas_plot_worker(job: Dict[str, object]) -> str:
+    config = job["config"]
+    file_fold_npc_index = str(job["file_fold_npc_index"])
+    GWASPCAEvaluator(config).plot_target(file_fold_npc_index)
+    return file_fold_npc_index
+
+
+def _roc_shap_worker(job: Dict[str, object]) -> str:
+    config = job["config"]
+    artifact = str(job["artifact"])
+    evaluator = RocShapEvaluator(config)
+    _generate_shap_output_for_artifact(
+        model_output_dir=str(evaluator.model_output_dir),
+        saved_models_dir=str(evaluator.saved_models_dir),
+        shap_output_dir=str(evaluator.shap_output_dir),
+        phenotype_column=evaluator.phenotype_column,
+        data_type=evaluator.data_type,
+        artifact=artifact,
+    )
+    return artifact
 
 
 class PredictionPipeline(object):
@@ -298,6 +332,8 @@ class PredictionPipeline(object):
 
         gff_raw = (configure.get("gff") or "").strip()
         self.gff = Path(gff_raw).resolve() if gff_raw else None
+        chrom_raw = (configure.get("chromosome_csv_path") or "").strip()
+        self.chromosome_csv_path = Path(chrom_raw).expanduser().resolve() if chrom_raw else None
 
         # Resources
         self.threads = _coerce_int("threads", configure.get("threads", ""), 96)
@@ -383,13 +419,6 @@ class PredictionPipeline(object):
         self.kraken_db = (configure.get("kraken_db", default_kraken_db) or default_kraken_db).strip()
         tag_outliers_raw = (configure.get("tag_outliers", "true") or "true").strip().lower()
         self.tag_outliers = tag_outliers_raw not in {"0", "false", "no", "off"}
-        prediction_python_raw = (configure.get("prediction_python", "") or "").strip()
-        if prediction_python_raw:
-            self.prediction_python = prediction_python_raw
-        else:
-            ml_python = Path("/opt/conda/envs/DGbreeding-ml/bin/python")
-            self.prediction_python = str(ml_python) if ml_python.exists() else sys.executable
-
         # --- Prediction / CV knobs (used in step 4/5 CV orchestration) ---
         self.pred_vcf_file = Path((configure.get("vcf_file_path") or "").strip()).expanduser().resolve() if (configure.get("vcf_file_path") or "").strip() else None
         self.pred_pheno_csv = Path((configure.get("phenotype_csv_path") or "").strip()).expanduser().resolve() if (configure.get("phenotype_csv_path") or "").strip() else None
@@ -398,11 +427,7 @@ class PredictionPipeline(object):
 
         self.pred_num_splits = _coerce_int("num_splits", configure.get("num_splits", ""), 5)
         self.pred_random_state = _coerce_int("random_state", configure.get("random_state", ""), 2024)
-        folds_path_raw = (configure.get("cv_folds_file") or "").strip()
-        if folds_path_raw:
-            self.pred_cv_folds_file = Path(folds_path_raw).expanduser().resolve()
-        else:
-            self.pred_cv_folds_file = self.prediction_outdir / "cv_folds.tsv"
+        self.pred_cv_folds_file = self.prediction_outdir / "cv_folds.tsv"
         # PCs used as GWAS covariates (separate from PCA extraction count)
         self.pred_gwas_pcs = (configure.get("gwas_n_pcs_list") or configure.get("gwas_n_pcs") or configure.get("n_pcs_list") or "0").strip()
         self.pred_pca_n_components = (configure.get("pca_n_components", "") or "").strip()
@@ -413,7 +438,11 @@ class PredictionPipeline(object):
         self.pred_cv_workers = _coerce_int("cv_workers", configure.get("cv_workers", ""), max(1, min(self.pred_num_splits, self.pred_num_threads)))
 
         # Model-level parallelism is handled in the pipeline job queue; keep for compatibility.
-        self.pred_inner_model_workers = _coerce_int("inner_model_workers", configure.get("inner_model_workers", ""), 1)
+        inner_model_raw = (configure.get("inner_model_workers", "") or "").strip()
+        if inner_model_raw:
+            self.pred_inner_model_workers = _coerce_int("inner_model_workers", inner_model_raw, 1)
+        else:
+            self.pred_inner_model_workers = 0
         if "5" in self.steps:
             self.pred_step5_mode = "full" if "4" in self.steps else "model_only"
         else:
@@ -430,11 +459,37 @@ class PredictionPipeline(object):
         return config_path
 
     def _require_prediction_inputs(self) -> tuple:
+        if self.pred_vcf_file is None:
+            self.pred_vcf_file = self._infer_pred_vcf_file()
+            if self.pred_vcf_file:
+                self.config["vcf_file_path"] = str(self.pred_vcf_file)
         if self.pred_vcf_file is None or not self.pred_vcf_file.exists():
-            raise FileNotFoundError("vcf_file_path is required and must exist.")
+            raise FileNotFoundError(
+                "vcf_file_path is required and must exist (could not infer from 02_Variant_Calling outputs)."
+            )
         if self.pred_pheno_csv is None or not self.pred_pheno_csv.exists():
             raise FileNotFoundError("phenotype_csv_path is required and must exist.")
         return self.pred_vcf_file, self.pred_pheno_csv
+
+    def _infer_pred_vcf_file(self) -> Optional[Path]:
+        if not self.variant_outdir.exists():
+            return None
+        candidates: List[Path] = []
+        if self.enable_ld_pruning:
+            candidates.append(self.variant_outdir / "cohort.filtered.ldpruned.vcf.gz")
+        candidates.append(self.variant_outdir / "cohort.filtered.vcf.gz")
+        candidates.append(self.variant_outdir / "cohort.merged.vcf.gz")
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        vcfs = [
+            p
+            for p in self.variant_outdir.glob("*.vcf*")
+            if ".g.vcf" not in p.name
+        ]
+        if len(vcfs) == 1:
+            return vcfs[0]
+        return None
 
     def _prepare_prediction_cv_configs(
         self,
@@ -537,6 +592,8 @@ class PredictionPipeline(object):
         for fold_cfg_path in fold_configs:
             fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
             config = read_config(fold_cfg["config_file"])
+            if not config.get("vcf_file_path"):
+                config["vcf_file_path"] = str(self.pred_vcf_file)
             file_fold_index = str(fold_cfg["file_fold_index"])
             gwas_pcs_raw = str(fold_cfg.get("gwas_pcs", "") or "")
             pca_n_components = CV_preparation.parse_optional_int(fold_cfg.get("pca_n_components"))
@@ -565,12 +622,14 @@ class PredictionPipeline(object):
                         "npz_path": str(npz_path),
                         "gwas_pc": int(pc),
                         "pca_n_components": pca_n_components,
+                        "vcf_file_path": str(self.pred_vcf_file),
                     }
                 )
 
         time_stamp(f"[step4] GWAS jobs queued: {len(jobs)}")
         finished: List[str] = []
-        with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
+        max_workers = max(1, min(int(self.threads), len(jobs)))
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(_cv_gwas_pc_worker, j) for j in jobs]
             for fut in as_completed(futs):
                 finished.append(fut.result())
@@ -601,6 +660,7 @@ class PredictionPipeline(object):
                         fold_cfg_path,
                         prepare=False,
                         repo_root=repo_root,
+                        vcf_file_path=None,
                     )
                 )
 
@@ -610,7 +670,14 @@ class PredictionPipeline(object):
                 return
 
             finished: List[str] = []
-            with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
+            max_workers = max(1, min(int(self.pred_cv_workers), len(jobs)))
+            if self.pred_inner_model_workers:
+                model_threads = int(self.pred_inner_model_workers)
+            else:
+                model_threads = max(1, int(self.pred_num_threads) // max_workers)
+            for job in jobs:
+                job["model_threads"] = model_threads
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 futs = [ex.submit(_cv_model_train_worker, j) for j in jobs]
                 for fut in as_completed(futs):
                     finished.append(fut.result())
@@ -628,6 +695,7 @@ class PredictionPipeline(object):
                     fold_cfg_path,
                     prepare=True,
                     repo_root=repo_root,
+                    vcf_file_path=str(self.pred_vcf_file),
                 )
             )
 
@@ -637,7 +705,14 @@ class PredictionPipeline(object):
             return
 
         finished: List[str] = []
-        with ProcessPoolExecutor(max_workers=int(self.pred_cv_workers)) as ex:
+        max_workers = max(1, min(int(self.pred_cv_workers), len(jobs)))
+        if self.pred_inner_model_workers:
+            model_threads = int(self.pred_inner_model_workers)
+        else:
+            model_threads = max(1, int(self.pred_num_threads) // max_workers)
+        for job in jobs:
+            job["model_threads"] = model_threads
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
             futs = [ex.submit(_cv_model_train_worker, j) for j in jobs]
             for fut in as_completed(futs):
                 finished.append(fut.result())
@@ -730,11 +805,51 @@ class PredictionPipeline(object):
             return
         if step_id == "4":
             time_stamp("[eva4] Manhattan/QQ plots")
-            GWASPCAEvaluator(self.config).run()
+            evaluator = GWASPCAEvaluator(self.config)
+            targets = evaluator.collect_targets()
+            if not targets:
+                print(f"No GWAS results found under {evaluator.gwas_output_dir}")
+                return
+            jobs = [{"config": self.config, "file_fold_npc_index": target} for target in targets]
+            max_workers = max(1, int(self.threads))
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_gwas_plot_worker, j) for j in jobs]
+                for fut in as_completed(futs):
+                    fut.result()
             return
         if step_id == "5":
             time_stamp("[eva5] Prediction ROC/AUC plots")
-            RocShapEvaluator(self.config).run()
+            evaluator = RocShapEvaluator(self.config)
+            probabilities_files = [
+                f for f in os.listdir(evaluator.model_output_dir) if f.startswith("Probabilities")
+            ]
+            testy_files = [f for f in os.listdir(evaluator.model_output_dir) if f.startswith("Testy")]
+            if not (probabilities_files and testy_files):
+                print(f"No prediction probability outputs found under {evaluator.model_output_dir}")
+                return
+            _plot_performance_comparison(
+                model_output_dir=str(evaluator.model_output_dir),
+                auc_plot_output_dir=str(evaluator.auc_plot_output_dir),
+                phenotype_column=evaluator.phenotype_column,
+                species_name=evaluator.species_name,
+            )
+            if not os.path.isdir(evaluator.saved_models_dir):
+                print(f"No saved models found under {evaluator.saved_models_dir}")
+                return
+            shap_targets = [
+                a
+                for a in sorted(os.listdir(evaluator.saved_models_dir))
+                if _parse_model_artifact(a)
+            ]
+            if not shap_targets:
+                print(f"No saved models found under {evaluator.saved_models_dir}")
+                return
+            jobs = [{"config": self.config, "artifact": target} for target in shap_targets]
+            max_workers = max(1, int(self.threads))
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_roc_shap_worker, j) for j in jobs]
+                for fut in as_completed(futs):
+                    fut.result()
             return
         raise ValueError(f"Unknown evaluation step: {step_id}")
 

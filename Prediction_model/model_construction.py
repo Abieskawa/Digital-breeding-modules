@@ -33,6 +33,8 @@ import torch.optim as optim
 import torch.nn.init as init
 from torch.utils.data import DataLoader, TensorDataset
 
+import pickle
+
 
 try:
     from sklearnex import patch_sklearn, unpatch_sklearn
@@ -68,7 +70,6 @@ class ModelConstruction:
     def __init__(self, config: dict):
         self.config = config
 
-        self.species_name = self.config.get('species_name')
         self.phenotype_column = self.config.get('phenotype_column', 'Phenotype')
         self.data_type = self.config.get('data_type', 'binary')
 
@@ -92,8 +93,20 @@ class ModelConstruction:
                               parse_int_list(self.config.get('gwas_n_pcs', '')) or \
                               parse_int_list(self.config.get('n_pcs_list', '0'))
 
-        self.num_threads = int(self.config.get('num_threads', '4'))
+        model_threads_raw = str(self.config.get("model_threads", "")).strip()
+        try:
+            self.model_threads = int(model_threads_raw) if model_threads_raw else 1
+        except (TypeError, ValueError):
+            self.model_threads = 1
+        if self.model_threads < 1:
+            self.model_threads = 1
+
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        try:
+            torch.set_num_threads(self.model_threads)
+            torch.set_num_interop_threads(self.model_threads)
+        except Exception:
+            pass
 
         # Where to save fitted models
         self.saved_models_dir = _resolve_outdir(
@@ -101,6 +114,27 @@ class ModelConstruction:
             subdir="Saved_models",
             ensure_dir=True,
         )
+
+    def _load_fold_data(self, file_fold_index: str, n_pcs: int, n_snps: int):
+        file_fold_npc_nsnp_index = f"{file_fold_index}_{n_pcs}PCs_{n_snps}SNPs"
+        current_dir = os.path.join(self.model_output_dir, file_fold_npc_nsnp_index)
+
+        train_csv_path = os.path.join(current_dir, f"train_selected_snps_{file_fold_npc_nsnp_index}.csv")
+        test_csv_path = os.path.join(current_dir, f"test_selected_snps_{file_fold_npc_nsnp_index}.csv")
+
+        if not (os.path.exists(train_csv_path) and os.path.exists(test_csv_path)):
+            raise FileNotFoundError(f"Missing model input CSVs for {file_fold_npc_nsnp_index}")
+
+        train_data = pd.read_csv(train_csv_path, index_col="taxa")
+        test_data = pd.read_csv(test_csv_path, index_col="taxa")
+
+        train_y = train_data["Phenotype"].values.astype(int)
+        train_X = train_data.drop(columns=["Phenotype"]).values
+        test_y = test_data["Phenotype"].values.astype(int)
+        test_X = test_data.drop(columns=["Phenotype"]).values
+        feature_list = train_data.drop(columns=["Phenotype"]).columns.tolist()
+
+        return train_X, train_y, test_X, test_y, feature_list
 
     def _save_model(self, model_name: str, model_obj, file_index: str, n_pcs: int, n_snps: int, feature_list: List[str]):
         base = f"{model_name}_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs"
@@ -125,7 +159,7 @@ class ModelConstruction:
             joblib.dump({"model": model_obj, "feature_list": feature_list}, path)
             return path
 
-        import pickle
+        
         path = os.path.join(self.saved_models_dir, f"{base}.pkl")
         with open(path, "wb") as f:
             pickle.dump({"model": model_obj, "feature_list": feature_list}, f)
@@ -133,7 +167,6 @@ class ModelConstruction:
 
     def run_machine_learning_and_save_results(self, args):
         """
-        Adapted from the reference run_machine_learning_and_save_results.
         Adds: saving fitted model to disk.
         """
         model_name, train_X, train_y, test_X, test_y, file_index, n_pcs, n_snps, feature_list = args
@@ -145,9 +178,17 @@ class ModelConstruction:
         if model_name == 'SVM':
             model = svm.SVC(kernel='rbf', probability=True)
         elif model_name == 'RandomForest':
-            model = ensemble.RandomForestClassifier(n_estimators=100, max_depth=3)
+            model = ensemble.RandomForestClassifier(
+                n_estimators=100,
+                max_depth=3,
+                n_jobs=self.model_threads,
+            )
         elif model_name == 'XGBoost':
-            model = XGBClassifier(n_estimators=100, learning_rate=0.3)
+            model = XGBClassifier(
+                n_estimators=100,
+                learning_rate=0.3,
+                n_jobs=self.model_threads,
+            )
         elif model_name == 'MLP':
             X_train_tensor = torch.tensor(train_X, dtype=torch.float32)
             X_test_tensor = torch.tensor(test_X, dtype=torch.float32)
@@ -270,46 +311,15 @@ class ModelConstruction:
         return metrics_dict
 
     def run_fold(self, file_fold_index: str, pcs: List[int], nsnps: List[int], models: List[str], max_workers: int):
-        models_list = []
         for pc in pcs:
             for n_snp in nsnps:
-                file_fold_npc_nsnp_index = f"{file_fold_index}_{pc}PCs_{n_snp}SNPs"
-                current_dir = os.path.join(self.model_output_dir, file_fold_npc_nsnp_index)
-
-                train_csv_path = os.path.join(current_dir, f'train_selected_snps_{file_fold_npc_nsnp_index}.csv')
-                test_csv_path = os.path.join(current_dir, f'test_selected_snps_{file_fold_npc_nsnp_index}.csv')
-
-                if not (os.path.exists(train_csv_path) and os.path.exists(test_csv_path)):
-                    raise FileNotFoundError(f"Missing model input CSVs for {file_fold_npc_nsnp_index}")
-
-                train_data = pd.read_csv(train_csv_path, index_col='taxa')
-                test_data = pd.read_csv(test_csv_path, index_col='taxa')
-
-                train_y = train_data['Phenotype'].values.astype(int)
-                train_X = train_data.drop(columns=['Phenotype']).values
-                test_y = test_data['Phenotype'].values.astype(int)
-                test_X = test_data.drop(columns=['Phenotype']).values
-                feature_list = train_data.drop(columns=['Phenotype']).columns.tolist()
-
+                train_X, train_y, test_X, test_y, feature_list = self._load_fold_data(
+                    file_fold_index, pc, n_snp
+                )
                 for model_name in models:
-                    models_list.append((model_name, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list))
-
-        for item in models_list:
-            self.run_machine_learning_and_save_results(item)
-
-    def cat_result(self):
-        result_files = [f for f in os.listdir(self.model_output_dir) if f.endswith('.csv')]
-        all_data = []
-        for file in result_files:
-            file_path = os.path.join(self.model_output_dir, file)
-            df = pd.read_csv(file_path)
-            all_data.append(df)
-        combined_df = pd.concat(all_data, ignore_index=True)
-        sorted_df = combined_df.sort_values(by=['n_pcs', 'n_snps', 'model_name'])
-        summarized_df = sorted_df.groupby(['n_pcs', 'n_snps', 'model_name'])[['accuracy', 'specificity', 'mcc', 'f1_score']].mean().reset_index()
-        sorted_df.to_csv(os.path.join(self.output_dir, 'model_evaluation_results_all.csv'), index=False)
-        summarized_df.to_csv(os.path.join(self.output_dir, 'model_evaluation_results_mean.csv'), index=False)
-        print("Summary file saved")
+                    self.run_machine_learning_and_save_results(
+                        (model_name, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list)
+                    )
 
 
 class PredictionModelCVStep:

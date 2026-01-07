@@ -10,7 +10,7 @@ gff=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.gff
 population=Streptococcus_resistance_population # For Readgroup/Circos naming (e.g., F2, diversity_panel)
 
 # Resources
-threads=92
+threads=96
 mem=8G
 
 # Step 1: Preprocessing DNA-seq (fastp)
@@ -70,28 +70,19 @@ target_seq=21
 # Model construction:
 num_splits=10  # x-fold cross-validation
 random_state=2024  # CV split seed
-cv_folds_file=  # Optional: reuse saved CV folds (default: <prediction_output_dir>/cv_folds.tsv)
 
 # Step 4: BLINK GWAS / PCA
 # BLINK (GWAS)
 # blink_bin=blink_linux         # BLINK binary name/path
-blink_gwas_workers=1           # >1 to run multiple BLINK jobs in parallel
+chromosome_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/chromsome_recode.csv  # Chromosome recode map for BLINK + Manhattan/QQ plots
 
 # PCA settings
 use_pcs=True  # Set to False if you don't want to use PCs
-n_pcs_list=0,1  # List of PCs to test, separated by commas #max:15
+n_pcs_list=0,1,2,3  # List of PCs to test, separated by commas #max:15
 
 # Step 5: SNP prediction model
 phenotype_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/pheno.csv
 #pheno.csv #AtPolyDB/pheno.csv
-vcf_file_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/filtered_tilapia_60_model_974729.vcf
-#tilapia_60_model.vcf #AtPolyDB/genotype_recode_filtered.vcf
-chromosome_csv_path=/home/abieskawa/output/marine_tilapia/Strepto_Resistance_Model/chromsome_recode.csv
-#chromsome_recode.csv #AtPolyDB/chromsome_recode.csv
-prediction_output_dir=prediction
-# step5_mode=full or model_only (model_only reuses existing Model_result CSVs)
-# If blank, prediction model uses output_dir; relative paths are under output_dir
-prediction_python= # Optional: override python path for step 5 (e.g., /opt/conda/envs/DGbreeding-ml/bin/python)
 
 # Phenotype column in your phenotype CSV
 species_name=Oreochromis_niloticus # Name of target species for name/title tag

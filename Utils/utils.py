@@ -140,6 +140,21 @@ def setup_local_env(outdir: Path) -> Tuple[Path, Path]:
     os.environ.setdefault("MPLBACKEND", "Agg")
     return tmp_dir, mpl_dir
 
+
+def setup_eval_env(outdir: Path) -> Tuple[Path, Path, Path]:
+    """
+    Standard evaluation setup: temp/cache dirs plus report directory with logs.
+    """
+    tmp_dir, mpl_dir = setup_local_env(outdir)
+    report_dir = _resolve_outdir(
+        base_outdir=outdir,
+        subdir="evaluation",
+        resolve=True,
+        ensure_dir=True,
+    )
+    (report_dir / "logs").mkdir(parents=True, exist_ok=True)
+    return tmp_dir, mpl_dir, report_dir
+
 def parallel_process(items: List[tuple], process_func, max_workers: int = 8, raise_on_error: bool = False):
     """
     Perform parallel processing using ProcessPoolExecutor.

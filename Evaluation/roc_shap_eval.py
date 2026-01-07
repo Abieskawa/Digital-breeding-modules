@@ -300,92 +300,88 @@ def _load_model(
     raise ValueError(f"Unsupported model artifact: {path}")
 
 
-def _generate_shap_outputs(
+def _generate_shap_output_for_artifact(
     *,
     model_output_dir: str,
     saved_models_dir: str,
     shap_output_dir: str,
     phenotype_column: str,
     data_type: str,
+    artifact: str,
 ) -> None:
-    if not os.path.isdir(saved_models_dir):
-        print(f"No saved models found under {saved_models_dir}")
+    parsed = _parse_model_artifact(artifact)
+    if not parsed:
         return
-    artifacts = sorted(os.listdir(saved_models_dir))
-    for artifact in artifacts:
-        parsed = _parse_model_artifact(artifact)
-        if not parsed:
-            continue
-        model_name = parsed["model_name"]
-        file_index = parsed["file_index"]
-        n_pcs = parsed["n_pcs"]
-        n_snps = parsed["n_snps"]
-        base = parsed["base"]
-        ext = parsed["ext"]
-        model_path = os.path.join(saved_models_dir, artifact)
+    model_name = parsed["model_name"]
+    file_index = parsed["file_index"]
+    n_pcs = parsed["n_pcs"]
+    n_snps = parsed["n_snps"]
+    base = parsed["base"]
+    ext = parsed["ext"]
+    model_path = os.path.join(saved_models_dir, artifact)
 
-        feature_list = _load_feature_list(saved_models_dir, base)
-        arrays = _load_train_test_arrays(
-            model_output_dir,
-            file_index,
-            n_pcs,
-            n_snps,
-            feature_list,
-            phenotype_column,
-        )
-        train_X = arrays["train_X"]
-        test_X = arrays["test_X"]
+    feature_list = _load_feature_list(saved_models_dir, base)
+    arrays = _load_train_test_arrays(
+        model_output_dir,
+        file_index,
+        n_pcs,
+        n_snps,
+        feature_list,
+        phenotype_column,
+    )
+    train_X = arrays["train_X"]
+    test_X = arrays["test_X"]
 
-        model = _load_model(
-            ext=ext,
-            path=model_path,
-            feature_list=feature_list,
-            data_type=data_type,
-        )
+    model = _load_model(
+        ext=ext,
+        path=model_path,
+        feature_list=feature_list,
+        data_type=data_type,
+    )
 
-        if model_name in ["RandomForest", "XGBoost"]:
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(test_X)
-            if model_name == "RandomForest":
-                shap_values_to_plot = shap_values[:, :, 1]
-            else:
-                shap_values_to_plot = shap_values
-        elif model_name == "MLP":
-            X_train_cpu = torch.tensor(train_X, dtype=torch.float32)
-            X_test_cpu = torch.tensor(test_X, dtype=torch.float32)
-            explainer = shap.GradientExplainer(model, X_train_cpu)
-            shap_values = explainer.shap_values(X_test_cpu)
-            shap_values_to_plot = np.squeeze(shap_values)
-        else:
-            if not hasattr(model, "predict_proba"):
-                print(f"Skipping SHAP for {model_name}: predict_proba unavailable")
-                continue
-            explainer = shap.KernelExplainer(model.predict_proba, train_X)
-            shap_values = explainer.shap_values(test_X)
+    if model_name in ["RandomForest", "XGBoost"]:
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(test_X)
+        if model_name == "RandomForest":
             shap_values_to_plot = shap_values[:, :, 1]
+        else:
+            shap_values_to_plot = shap_values
+    elif model_name == "MLP":
+        X_train_cpu = torch.tensor(train_X, dtype=torch.float32)
+        X_test_cpu = torch.tensor(test_X, dtype=torch.float32)
+        explainer = shap.GradientExplainer(model, X_train_cpu)
+        shap_values = explainer.shap_values(X_test_cpu)
+        shap_values_to_plot = np.squeeze(shap_values)
+    else:
+        if not hasattr(model, "predict_proba"):
+            print(f"Skipping SHAP for {model_name}: predict_proba unavailable")
+            return
+        explainer = shap.KernelExplainer(model.predict_proba, train_X)
+        shap_values = explainer.shap_values(test_X)
+        shap_values_to_plot = shap_values[:, :, 1]
 
-        df_shap_values = pd.DataFrame(shap_values_to_plot, columns=feature_list)
-        df_feature_importance = pd.DataFrame(columns=["feature", "importance"])
-        for col in df_shap_values.columns:
-            importance = df_shap_values[col].abs().mean()
-            df_feature_importance.loc[len(df_feature_importance)] = [col, importance]
-            df_feature_importance = df_feature_importance.sort_values("importance", ascending=False)
+    df_shap_values = pd.DataFrame(shap_values_to_plot, columns=feature_list)
+    df_feature_importance = pd.DataFrame(columns=["feature", "importance"])
+    for col in df_shap_values.columns:
+        importance = df_shap_values[col].abs().mean()
+        df_feature_importance.loc[len(df_feature_importance)] = [col, importance]
+        df_feature_importance = df_feature_importance.sort_values("importance", ascending=False)
 
-        df_feature_importance_file = os.path.join(
-            model_output_dir,
-            f"ShapTop10_{model_name}_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.csv",
-        )
-        df_feature_importance.to_csv(df_feature_importance_file, index=False)
+    df_feature_importance_file = os.path.join(
+        model_output_dir,
+        f"ShapTop10_{model_name}_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.csv",
+    )
+    df_feature_importance.to_csv(df_feature_importance_file, index=False)
 
-        plt.figure()
-        shap.summary_plot(shap_values_to_plot, test_X, feature_names=feature_list, show=False)
-        plt.title(f"{model_name} SHAP Summary Plot (Fold {file_index},PC{n_pcs},{n_snps}SNPs)")
-        shap_plot = os.path.join(
-            shap_output_dir,
-            f"{model_name}_SHAP_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.png",
-        )
-        plt.savefig(shap_plot)
-        plt.close()
+    plt.figure()
+    shap.summary_plot(shap_values_to_plot, test_X, feature_names=feature_list, show=False)
+    plt.title(f"{model_name} SHAP Summary Plot (Fold {file_index},PC{n_pcs},{n_snps}SNPs)")
+    shap_plot = os.path.join(
+        shap_output_dir,
+        f"{model_name}_SHAP_Fold_{file_index}_PC{n_pcs}_{n_snps}SNPs.png",
+    )
+    plt.savefig(shap_plot)
+    plt.close()
 
 
 class RocShapEvaluator:
@@ -403,7 +399,7 @@ class RocShapEvaluator:
     def run(self) -> None:
         probabilities_files = [f for f in os.listdir(self.model_output_dir) if f.startswith("Probabilities")]
         testy_files = [f for f in os.listdir(self.model_output_dir) if f.startswith("Testy")]
-        if not probabilities_files or not testy_files:
+        if not (probabilities_files and testy_files):
             print(f"No prediction probability outputs found under {self.model_output_dir}")
             return
         _plot_performance_comparison(
@@ -412,10 +408,16 @@ class RocShapEvaluator:
             phenotype_column=self.phenotype_column,
             species_name=self.species_name,
         )
-        _generate_shap_outputs(
-            model_output_dir=str(self.model_output_dir),
-            saved_models_dir=str(self.saved_models_dir),
-            shap_output_dir=str(self.shap_output_dir),
-            phenotype_column=self.phenotype_column,
-            data_type=self.data_type,
-        )
+        if not os.path.isdir(self.saved_models_dir):
+            return
+        for artifact in sorted(os.listdir(self.saved_models_dir)):
+            if not _parse_model_artifact(artifact):
+                continue
+            _generate_shap_output_for_artifact(
+                model_output_dir=str(self.model_output_dir),
+                saved_models_dir=str(self.saved_models_dir),
+                shap_output_dir=str(self.shap_output_dir),
+                phenotype_column=self.phenotype_column,
+                data_type=self.data_type,
+                artifact=artifact,
+            )

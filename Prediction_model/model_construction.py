@@ -17,7 +17,7 @@ Cross-validation orchestration is intentionally NOT implemented here
 """
 import os
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -321,29 +321,3 @@ class ModelConstruction:
                         (model_name, train_X, train_y, test_X, test_y, file_fold_index, pc, n_snp, feature_list)
                     )
 
-
-class PredictionModelCVStep:
-    def __init__(
-        self,
-        fold_configs: List[Path],
-        max_workers: int,
-        inner_model_workers: int,
-        worker: Callable[[Dict[str, object]], str],
-    ):
-        self.fold_configs = fold_configs
-        self.max_workers = max_workers
-        self.inner_model_workers = inner_model_workers
-        self.worker = worker
-
-    def run(self) -> List[str]:
-        finished: List[str] = []
-        for cfg in self.fold_configs:
-            finished.append(
-                self.worker(
-                    {
-                        "fold_config": str(cfg),
-                        "inner_model_workers": int(self.inner_model_workers),
-                    }
-                )
-            )
-        return finished

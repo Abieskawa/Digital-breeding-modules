@@ -87,8 +87,6 @@ def main():
     print(flush=True)
 
     idx_file = os.path.join(star_index, 'SAindex')
-    if os.path.exists(idx_file):
-        print(f"STAR index exists.", flush=True)
     if not os.path.exists(idx_file):
         cmd = [
             'STAR','--runMode','genomeGenerate',

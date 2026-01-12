@@ -5,6 +5,8 @@ from pathlib import Path
 
 from Utils.utils import _resolve_outdir, setup_eval_env
 
+DEFAULT_KRAKEN_DB = "/kraken2_db"
+
 
 class MappingEvalBase:
     def __init__(self, args):
@@ -25,12 +27,5 @@ class MappingEvalBase:
         else:
             self.tag_outliers = bool(raw_tag)
 
-        default_kraken_db = "/kraken_db"
-        db_val = getattr(args, "kraken_db", default_kraken_db)
-        if isinstance(db_val, str):
-            db_val = (db_val or default_kraken_db).strip()
-        else:
-            db_val = str(db_val).strip() if db_val else default_kraken_db
-        self.kraken_db = db_val
-
+        self.kraken_db = DEFAULT_KRAKEN_DB
         # report_dir already created by setup_eval_env

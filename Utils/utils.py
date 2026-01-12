@@ -5,7 +5,6 @@ import numpy as np
 import shutil
 import subprocess as sbp
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path  # <-- add this
 from typing import Dict, Iterable, List, Optional, TYPE_CHECKING, Tuple
@@ -63,6 +62,102 @@ def parse_int_list(raw: str) -> List[int]:
             parts.extend([p for p in chunk.split(" ") if p.strip()])
     return [int(p) for p in parts]
 
+def encode_phenotype_series(series, *, log_prefix: str = "Phenotype"):
+    """
+    Encode non-numeric phenotype values into numeric codes.
+    Returns (encoded_series, mapping_dict). Numeric series are returned unchanged.
+    """
+    if series is None:
+        return series, {}
+
+    import pandas as pd
+
+    s = series.copy()
+    if s.empty:
+        return s, {}
+
+    numeric = pd.to_numeric(s, errors="coerce")
+    if numeric.notna().sum() == s.notna().sum():
+        return numeric, {}
+
+    def _norm(val) -> str:
+        return str(val).strip().lower()
+
+    non_null = s.dropna()
+    norm_vals = non_null.map(_norm)
+    unique_norm = list(dict.fromkeys(norm_vals))
+    unique_norm_set = set(unique_norm)
+
+    survive_keys = {"survive", "survived", "survival", "alive"}
+    death_keys = {"death", "dead"}
+
+    mapping_norm = {}
+    if (survive_keys & unique_norm_set) and (death_keys & unique_norm_set) and unique_norm_set <= (survive_keys | death_keys):
+        for key in unique_norm:
+            if key in survive_keys:
+                mapping_norm[key] = 0
+            elif key in death_keys:
+                mapping_norm[key] = 1
+    else:
+        mapping_norm = {key: idx for idx, key in enumerate(sorted(unique_norm_set))}
+
+    mapping = {val: mapping_norm[_norm(val)] for val in pd.unique(non_null.astype(str))}
+    encoded = non_null.map(lambda v: mapping_norm.get(_norm(v)))
+    encoded_series = s.copy()
+    encoded_series.loc[non_null.index] = encoded
+    encoded_series = pd.to_numeric(encoded_series, errors="coerce")
+
+    time_stamp(f"{log_prefix} encoding applied: {mapping}")
+    return encoded_series, mapping
+
+def _load_chromosome_recode(chromosome_csv_path: Optional[Path], *, required: bool = False) -> Dict[str, str]:
+    if not chromosome_csv_path:
+        if required:
+            raise ValueError("chromosome_csv_path is required for Manhattan/QQ plots")
+        return {}
+    path = Path(chromosome_csv_path)
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"chromosome_csv_path not found: {path}")
+        return {}
+    import pandas as pd
+    mapping = pd.read_csv(path, sep=None, engine="python", comment="#")
+    return dict(
+        zip(
+            mapping["OriginalName"].astype(str),
+            mapping["Label"].astype(str),
+        )
+    )
+
+def _optional_int(val, default=None, none_if_blank: bool = True):
+    if val in (None, "", False):
+        return None if none_if_blank else default
+    try:
+        iv = int(val)
+    except (TypeError, ValueError):
+        return default
+    if none_if_blank and iv == 0:
+        return None
+    return iv
+
+def fasta_lengths(fa: Path) -> Dict[str, int]:
+    lens: Dict[str, int] = {}
+    opn = gzip.open if str(fa).endswith(".gz") else open
+    with opn(fa, "rt", errors="replace") as f:
+        name = None
+        size = 0
+        for ln in f:
+            if ln.startswith(">"):
+                if name:
+                    lens[name] = size
+                name = ln[1:].split()[0]
+                size = 0
+            else:
+                size += len(ln.strip())
+        if name:
+            lens[name] = size
+    return lens
+
 def _open_text_maybe_gz(path: str):
     """
     Open a text file that may be plain or gzipped, based on magic header.
@@ -116,7 +211,12 @@ def _ensure_bgzip_and_index(vcf_path: Path) -> Path:
     Ensure <vcf>.gz exists and is indexed (csi/tbi).
     Returns the gz path.
     """
-    gz_path = Path(str(vcf_path) + ".gz")
+    vcf_path = Path(vcf_path)
+    if str(vcf_path).endswith(".gz"):
+        gz_path = vcf_path
+        vcf_path = Path(str(vcf_path)[:-3])
+    else:
+        gz_path = Path(str(vcf_path) + ".gz")
     if not gz_path.exists():
         time_stamp(f"Creating bgzip VCF: {gz_path}")
         sbp.run(f"bgzip -c {vcf_path} > {gz_path}", shell=True, check=True)
@@ -154,25 +254,6 @@ def setup_eval_env(outdir: Path) -> Tuple[Path, Path, Path]:
     )
     (report_dir / "logs").mkdir(parents=True, exist_ok=True)
     return tmp_dir, mpl_dir, report_dir
-
-def parallel_process(items: List[tuple], process_func, max_workers: int = 8, raise_on_error: bool = False):
-    """
-    Perform parallel processing using ProcessPoolExecutor.
-    Each item in `items` is a tuple of arguments for `process_func`.
-    """
-    print(f"Starting parallel processing with {max_workers} workers")
-    results = []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_func, item) for item in items]
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                print(f"Task failed with exception: {e}")
-                if raise_on_error:
-                    raise
-    print("Parallel processing complete")
-    return results
 
 def _resolve_outdir(
     config: Optional[Dict[str, str]] = None,

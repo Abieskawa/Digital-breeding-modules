@@ -13,7 +13,7 @@ from Evaluation.contamination import ContaminationEvaluator
 from Evaluation.evaluate_mapping import MappingYieldEvaluator
 from Evaluation.fastq_qc import FastQCEvaluator
 from Evaluation.variant_circos import VariantCircosEvaluator
-from Evaluation.gwas_pca_eval import GWASPCAEvaluator
+from Evaluation.gwas_pca_eval import GWASPCAEvaluator, PCAEvaluator
 from Evaluation.roc_shap_eval import (
     RocShapEvaluator,
     _generate_shap_output_for_artifact,
@@ -23,7 +23,7 @@ from Evaluation.roc_shap_eval import (
 from Utils.bed_generator import build_capture_bed
 from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool, _save_numeric_npz
 from Utils.cv_preparation import CV_preparation
-from Prediction_model.gwas_pca import GWAS_PCA
+from GWAS.run_blink_gwas_pca import GWAS_PCA
 from Prediction_model.model_construction import ModelConstruction
 from Prediction_model.snp_numeric_transformer import SNP_numerical
 
@@ -117,15 +117,6 @@ def _set_thread_env(num_threads: int) -> None:
         pass
 
 
-def _default_gwas_pcs(config: Dict[str, str]) -> List[int]:
-    pcs = (
-        parse_int_list(config.get("gwas_n_pcs_list", ""))
-        or parse_int_list(config.get("gwas_n_pcs", ""))
-        or parse_int_list(config.get("n_pcs_list", "0"))
-    )
-    return pcs or [0]
-
-
 def _prepare_fold_numeric_npz(
     config: Dict[str, str],
     *,
@@ -147,7 +138,7 @@ def _prepare_fold_numeric_npz(
     return npz_path
 
 
-def _cv_gwas_pc_worker(job: Dict[str, object]) -> str:
+def _cv_gwas_worker(job: Dict[str, object]) -> str:
     _ensure_repo_root(str(job.get("repo_root", "") or ""))
     config = read_config(str(job["config_file"]))
     vcf_file_path = job.get("vcf_file_path")
@@ -155,16 +146,16 @@ def _cv_gwas_pc_worker(job: Dict[str, object]) -> str:
         config["vcf_file_path"] = str(vcf_file_path)
     gwas_tool = GWAS_PCA(config)
     file_fold_index = str(job["file_fold_index"])
-    gwas_pc = str(job["gwas_pc"])
+    gwas_pcs = str(job.get("gwas_pcs", "") or "")
     pca_n_components = job.get("pca_n_components")
 
     gwas_tool.run_fold(
         file_fold_index,
         str(job["npz_path"]),
-        gwas_pcs_override=gwas_pc,
+        gwas_pcs_override=gwas_pcs,
         pca_components_override=pca_n_components,
     )
-    return f"{file_fold_index}_{gwas_pc}PCs"
+    return f"{file_fold_index}_{gwas_pcs or 'default'}"
 
 
 def _build_model_jobs_for_fold(
@@ -268,6 +259,15 @@ def _gwas_plot_worker(job: Dict[str, object]) -> str:
     file_fold_npc_index = str(job["file_fold_npc_index"])
     GWASPCAEvaluator(config).plot_target(file_fold_npc_index)
     return file_fold_npc_index
+
+
+def _pca_plot_worker(job: Dict[str, object]) -> str:
+    config = job["config"]
+    file_fold_index = str(job["file_fold_index"])
+    pca_tool = PCAEvaluator(config)
+    if not pca_tool.plot_fold_pca_from_files(file_fold_index):
+        print(f"No PCA components found for fold {file_fold_index}")
+    return file_fold_index
 
 
 def _roc_shap_worker(job: Dict[str, object]) -> str:
@@ -381,7 +381,6 @@ class PredictionPipeline(object):
         self.variant_outdir = _resolve_outdir(base_outdir=self.outdir, subdir="02_Variant_Calling", resolve=True)
 
         # Optional VC knobs (leave unset if not present; VariantCalling has sane defaults)
-        self.deepvariant_image = configure.get("deepvariant_image", "google/deepvariant:1.10.0-beta")
         self.deepvariant_use_gpu = coerce_bool(configure.get("deepvariant_use_gpu", ""), False)
         self.model_type = configure.get("model_type", "WGS")  # or WES
         self.capture_bed = configure.get("capture_bed", "") or None
@@ -411,12 +410,6 @@ class PredictionPipeline(object):
         self.gff_biotype = configure.get("gff_biotype", "protein_coding")
         self.circos_window = _coerce_int("circos_window", configure.get("circos_window", ""), 10000)  # in bp
         self.circos_tick_step = _coerce_int("circos_tick_step", configure.get("circos_tick_step", ""), 0) or None
-        chroms_raw = (configure.get("circos_chroms", "") or "").replace(";", ",")
-        self.circos_chroms = [c.strip() for c in chroms_raw.split(",") if c.strip()]
-        self.target_seq = _coerce_int("target_seq", configure.get("target_seq", ""), 0)
-        # Default to Docker-mounted Kraken DB path; override via config if provided
-        default_kraken_db = "/kraken_db"
-        self.kraken_db = (configure.get("kraken_db", default_kraken_db) or default_kraken_db).strip()
         tag_outliers_raw = (configure.get("tag_outliers", "true") or "true").strip().lower()
         self.tag_outliers = tag_outliers_raw not in {"0", "false", "no", "off"}
         # --- Prediction / CV knobs (used in step 4/5 CV orchestration) ---
@@ -609,28 +602,23 @@ class PredictionPipeline(object):
                 prediction_outdir=self.prediction_outdir,
             )
 
-            pcs = parse_int_list(gwas_pcs_raw) if gwas_pcs_raw.strip() else _default_gwas_pcs(config)
-            if not pcs:
-                pcs = [0]
-
-            for pc in pcs:
-                jobs.append(
-                    {
-                        "config_file": str(Path(fold_cfg["config_file"]).expanduser()),
-                        "repo_root": str(repo_root),
-                        "file_fold_index": file_fold_index,
-                        "npz_path": str(npz_path),
-                        "gwas_pc": int(pc),
-                        "pca_n_components": pca_n_components,
-                        "vcf_file_path": str(self.pred_vcf_file),
-                    }
-                )
+            jobs.append(
+                {
+                    "config_file": str(Path(fold_cfg["config_file"]).expanduser()),
+                    "repo_root": str(repo_root),
+                    "file_fold_index": file_fold_index,
+                    "npz_path": str(npz_path),
+                    "gwas_pcs": gwas_pcs_raw,
+                    "pca_n_components": pca_n_components,
+                    "vcf_file_path": str(self.pred_vcf_file),
+                }
+            )
 
         time_stamp(f"[step4] GWAS jobs queued: {len(jobs)}")
         finished: List[str] = []
         max_workers = max(1, min(int(self.threads), len(jobs)))
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(_cv_gwas_pc_worker, j) for j in jobs]
+            futs = [ex.submit(_cv_gwas_worker, j) for j in jobs]
             for fut in as_completed(futs):
                 finished.append(fut.result())
         time_stamp(f"[step4] Completed jobs: {len(finished)}")
@@ -814,6 +802,17 @@ class PredictionPipeline(object):
             max_workers = max(1, int(self.threads))
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
                 futs = [ex.submit(_gwas_plot_worker, j) for j in jobs]
+                for fut in as_completed(futs):
+                    fut.result()
+            time_stamp("[eva4] PCA scatter/scree plots")
+            pca_tool = PCAEvaluator(self.config)
+            pca_targets = pca_tool.collect_pca_targets()
+            if not pca_targets:
+                print(f"No PCA components found under {pca_tool.pca_scree_output_dir}")
+                return
+            pca_jobs = [{"config": self.config, "file_fold_index": target} for target in pca_targets]
+            with ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_pca_plot_worker, j) for j in pca_jobs]
                 for fut in as_completed(futs):
                     fut.result()
             return

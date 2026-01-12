@@ -19,23 +19,21 @@ class DNAAlignment:
         self.align_outdir.mkdir(parents=True, exist_ok=True)
         self.align_log = self.align_outdir / "alignment.log"
         self.align_log.touch(exist_ok=True) # Create the file it does not exist .
-        self.seq_platform = args.seq_platform
+        self.seq_platform = str(args.seq_platform).strip().lower()
         self.mark_duplicates = getattr(args, "mark_duplicates", True)
         self.filter_proper_pairs = getattr(args, "filter_proper_pairs", True)
         # Allow explicit override; otherwise derive from platform with a safe default
         self.optical_distance = getattr(args, "optical_distance", None)
         if self.optical_distance is None:
-            if self.seq_platform in ['NovaSeq']:
+            if self.seq_platform == 'novaseq':
                 self.optical_distance = 2500
                 # ref: http://www.htslib.org/algorithms/duplicate.html
-            elif self.seq_platform in ['HiSeq']:
-                self.optical_distance = 100
-            elif self.seq_platform.lower() == 'other':
-                self.optical_distance = 100
-                print('Sequencing platform set to "other"; defaulting optical distance to 100. Override via optical_distance if needed.')
             else:
                 self.optical_distance = 100
-                print('Sequencing platform is not recorded; defaulting optical distance to HiSeq (100).')
+                if self.seq_platform == 'other':
+                    print('Sequencing platform set to "other"; defaulting optical distance to 100. Override via optical_distance if needed.')
+                elif self.seq_platform not in {'hiseq', ''}:
+                    print('Sequencing platform is not recorded; defaulting optical distance to HiSeq (100).')
         
         self.processed_outdir = Path(args.fastp_outdir)
 

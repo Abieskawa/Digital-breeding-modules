@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import subprocess as sbp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -15,7 +16,6 @@ from Utils.utils import (
     _count_reads_in_fastq,
     _discover_pairs_in_dir,
     _kreport_total_reads,
-    call_log,
     time_stamp,
 )
 from Evaluation.mapping_base import MappingEvalBase
@@ -126,16 +126,40 @@ def _prepare_kraken_inputs(sample: str, r1: Path, r2: Optional[Path]):
     return r1, r2, total_pairs, gzip_input
 
 
+def _run_kraken_job(job: Dict[str, object]) -> Tuple[str, Optional[str]]:
+    sample = str(job["sample"])
+    try:
+        _run_kraken2(
+            r1=job["r1"],
+            r2=job["r2"],
+            db=job["db"],
+            threads=int(job["threads"]),
+            out_report=job["kreport"],
+            out_assign=job["kout"],
+            log_dir=job.get("log_dir"),
+            label=sample,
+            gzip_input=bool(job["gzip_input"]),
+        )
+        kout = job["kout"]
+        if isinstance(kout, Path) and kout.exists():
+            try:
+                sbp.run(["pigz", "-f", str(kout)], check=True, stdout=sbp.DEVNULL, stderr=sbp.DEVNULL)
+            except Exception as exc:
+                return sample, f"[contam] pigz failed for {kout}: {exc}"
+        return sample, None
+    except sbp.CalledProcessError as exc:
+        failed_cmd = exc.cmd if isinstance(exc.cmd, str) else "kraken2"
+        return sample, f"[sample {sample}] {failed_cmd} (exit {exc.returncode})"
+    except Exception as exc:
+        return sample, f"[sample {sample}] {exc}"
+
+
 class ContaminationEvaluator(MappingEvalBase):
     """
     Step 1: Kraken2 on all reads; aggregate species Top-5 across samples (boxplot).
     """
 
     def evaluate_contamination(self) -> Optional[pd.DataFrame]:
-        if not self.kraken_db:
-            time_stamp("[contam] skip: kraken_db not set")
-            return None
-
         pairs = _discover_pairs_in_dir(self.fastp_outdir)
         if not pairs:
             pairs = _discover_pairs_in_dir(self.input_dir)
@@ -164,6 +188,7 @@ class ContaminationEvaluator(MappingEvalBase):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         all_rows = []
+        jobs: List[Dict[str, object]] = []
 
         for rec in pairs:
             sample, r1, r2 = rec["sample"], rec["r1"], rec["r2"]
@@ -178,32 +203,61 @@ class ContaminationEvaluator(MappingEvalBase):
 
             krep = out_dir / f"{sample}.kreport"
             kout = out_dir / f"{sample}.kout"
-            try:
-                _run_kraken2(
-                    r1=r1_for_kraken, r2=r2_for_kraken,
+            jobs.append(
+                dict(
+                    sample=sample,
+                    r1=r1_for_kraken,
+                    r2=r2_for_kraken,
                     db=db_path,
-                    threads=self.threads,
-                    out_report=krep,
-                    out_assign=kout,
+                    kreport=krep,
+                    kout=kout,
                     log_dir=log_dir,
-                    label=sample,
                     gzip_input=gzip_input,
+                    total_records=sample_total_records,
                 )
-                sample_total_records = _kreport_total_reads(krep) or sample_total_records
-                if kout.exists():
-                    try:
-                        sbp.run(["pigz", "-f", str(kout)], check=True, stdout=sbp.DEVNULL, stderr=sbp.DEVNULL)
-                    except Exception as e:
-                        time_stamp(f"[contam] pigz failed for {kout}: {e}")
-            except sbp.CalledProcessError as e:
-                failed_cmd = e.cmd if isinstance(e.cmd, str) else "kraken2"
-                call_log(
-                    log_dir,
-                    "kraken2",
-                    f"[sample {sample}] {failed_cmd} (exit {e.returncode})",
-                )
-                continue
+            )
 
+        if not jobs:
+            time_stamp("[contam] no Kraken2 jobs to run")
+            return None
+
+        total_threads = max(1, int(self.threads))
+        if total_threads < 16:
+            workers = 1
+        else:
+            workers = max(1, total_threads // 16)
+        workers = min(workers, len(jobs))
+        threads_per_job = max(1, total_threads // max(1, workers))
+
+        time_stamp(f"[contam] Kraken2 workers={workers}, threads/job={threads_per_job}")
+        for job in jobs:
+            job["threads"] = threads_per_job
+
+        failed_samples = set()
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(_run_kraken_job, job) for job in jobs]
+                for fut in as_completed(futs):
+                    sample, err = fut.result()
+                    if err:
+                        failed_samples.add(sample)
+                        _append_log_line(log_dir, "kraken2", err)
+        else:
+            for job in jobs:
+                sample, err = _run_kraken_job(job)
+                if err:
+                    failed_samples.add(sample)
+                    _append_log_line(log_dir, "kraken2", err)
+                    continue
+
+        for job in jobs:
+            sample = job["sample"]
+            if sample in failed_samples:
+                continue
+            krep = job["kreport"]
+            if not krep.exists():
+                continue
+            sample_total_records = _kreport_total_reads(krep) or int(job["total_records"])
             df = _summarize_kreport_species(krep)
             if df is not None and not df.empty:
                 df["sample"] = sample

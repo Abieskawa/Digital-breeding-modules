@@ -22,7 +22,6 @@ class VariantCalling:
         variant_outdir, align_outdir, ref_fasta, threads
 
     Optional defaults:
-        deepvariant_image='google/deepvariant:1.9.0'
         model_type='WGS'  # or 'WES'
         capture_bed=None
         hwe_p='1e-5'
@@ -43,7 +42,6 @@ class VariantCalling:
 
         self.variant_outdir.mkdir(parents=True, exist_ok=True)
 
-        self.deepvariant_image = getattr(args, 'deepvariant_image', 'google/deepvariant:1.10.0-beta')
         self.deepvariant_use_gpu = coerce_bool(getattr(args, 'deepvariant_use_gpu', None), False)
         self._deepvariant_use_gpu_supported = None
         self.model_type        = getattr(args, 'model_type', 'WGS')

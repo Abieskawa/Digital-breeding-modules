@@ -3,28 +3,11 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 import gzip
 
+from Utils.utils import fasta_lengths
 
 def _open_text(path: Path):
     opn = gzip.open if str(path).endswith(".gz") else open
     return opn(path, "rt", errors="replace")
-
-
-def fasta_lengths(fa: Path) -> Dict[str, int]:
-    lens: Dict[str, int] = {}
-    with _open_text(fa) as f:
-        name = None
-        size = 0
-        for line in f:
-            if line.startswith(">"):
-                if name:
-                    lens[name] = size
-                name = line[1:].split()[0]
-                size = 0
-            else:
-                size += len(line.strip())
-        if name:
-            lens[name] = size
-    return lens
 
 
 def gff_contigs_with_genes(gff: Path, include_biotype: Optional[str] = None) -> Set[str]:

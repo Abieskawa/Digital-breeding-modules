@@ -221,15 +221,10 @@ class CV_preparation:
 
             fold_samples = []
             fold_counter = 0
-            repeat_counter = 1
             for train_idx, test_idx in splitter.split(np.zeros(len(common)), y):
                 fold_counter += 1
-                if fold_counter > n_splits:
-                    repeat_counter += 1
-                    fold_counter = 1
-                repeat_index = repeat_counter
                 fold_index = fold_counter
-                file_fold_index = f"{repeat_index}-{fold_index}"
+                file_fold_index = f"{fold_index}"
                 train_samples = [common[i] for i in train_idx]
                 test_samples = [common[i] for i in test_idx]
                 fold_samples.append(

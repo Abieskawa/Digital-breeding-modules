@@ -7,6 +7,7 @@ output_dir=DGBreeding
 input_dir=DNA_seq
 ref_fasta=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.fna
 gff=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.gff
+chromosome_csv_path=/data/eva3_run/chromsome_recode.txt
 population=Streptococcus_resistance_population # For Readgroup/Circos naming (e.g., F2, diversity_panel)
 
 # Resources
@@ -62,10 +63,6 @@ gff_biotype=protein_coding
 circos_window=10000 # bp; bin size for both gene and variant tracks
 # Optional: control circos tick spacing
 circos_tick_step=10000000    # bp; set e.g., 10000000 for 10 Mb fixed tick spacing; if blank -> only 0 and end
-# Number of longest chromosomes/contigs to plot in circos (e.g., 21 = top 21 by length)
-target_seq=21
-# Alternatively, restrict circos to specific chromosomes/contigs (comma-separated). Leave blank to plot all.
-# circos_chroms=chr1,chr2,chr3
 
 # Model construction:
 num_splits=10  # x-fold cross-validation
@@ -98,5 +95,4 @@ models=MLP,SVM,RandomForest,XGBoost  # List of models to test, separated by comm
 
 # Evaluation
 # Toggle labeling for boxplot outliers/medians (Kraken + mapping). Accepts true/false/0/1/no/off.
-kraken_db=/data/kraken2_db
 tag_outliers=false

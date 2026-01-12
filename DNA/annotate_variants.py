@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import sys
-import argparse
 import gzip
 import csv
 import os
@@ -9,32 +8,6 @@ from collections import defaultdict
 
 # Increase CSV field size limit if needed
 csv.field_size_limit(sys.maxsize)
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        description='Annotate variants from a model CSV with "feature,importance", '
-                    'extracting model, fold, PC, and #SNPs from the filename. '
-                    'Keeps only non-zero importance variants, checks them in a VCF, '
-                    'and annotates them as in-gene or nearest upstream/downstream. '
-                    'Optionally pick the top X unique importance scores (ties included), '
-                    'or use "all" to keep all non-zero. Output is sorted by importance.'
-    )
-    parser.add_argument('-m', '--model-csv', required=True,
-                        help='CSV file, e.g. "ShapTop10_XGBoost_Fold_3-6_PC0_20SNPs.csv". '
-                             'We parse its filename for (model, fold, pc, n_snps) and read nonzero rows from it.')
-    parser.add_argument('-c', '--vcf', required=True,
-                        help='VCF file (optionally gzipped). 3rd column (ID) must match "feature" from the model CSV.')
-    parser.add_argument('-g', '--gff', required=True,
-                        help='GFF file (optionally gzipped) with gene (or mRNA) features.')
-    parser.add_argument('-o', '--output',
-                        help='Output file path. If omitted, prints to stdout.')
-    parser.add_argument('--topx', default='all',
-                        help='Keep only the top X unique importance scores (including ties), '
-                             'or "all" to keep all non-zero. E.g. "--topx 10" or "--topx all" (default).')
-    # New flag for MOLAS mode: use mRNA-level annotations instead of gene-level.
-    parser.add_argument('--molas', action='store_true',
-                        help='Activate MOLAS mode: use mRNA-level annotations (the label is extracted from mRNA entries).')
-    return parser.parse_args()
 
 def parse_model_filename(filename):
     """
@@ -287,35 +260,41 @@ def find_nearest_genes(chrom_map, chrom, pos):
         out.append(downstream)
     return out
 
-def main():
-    args = parse_arguments()
-
-    meta = parse_model_filename(args.model_csv)
+def annotate_variants(
+    model_csv: str,
+    vcf: str,
+    gff: str,
+    *,
+    output: str = "",
+    topx: str = "all",
+    molas: bool = False,
+):
+    meta = parse_model_filename(model_csv)
     model   = meta.get('model',  '-')
     fold    = meta.get('fold',   '-')
     pc_val  = meta.get('pc',     '-')
     n_snps  = meta.get('n_snps', '-')
 
-    print(f"Reading model CSV: {args.model_csv}", file=sys.stderr)
-    rows = load_nonzero_snps(args.model_csv, topx_option=args.topx)
+    print(f"Reading model CSV: {model_csv}", file=sys.stderr)
+    rows = load_nonzero_snps(model_csv, topx_option=topx)
     if not rows:
         print("No non-zero importance SNPs found after filtering.", file=sys.stderr)
-        sys.exit(0)
+        return []
 
     features = [r[0] for r in rows]
 
     print("Loading VCF...", file=sys.stderr)
-    id_to_pos = load_vcf_by_ids(args.vcf, features)
+    id_to_pos = load_vcf_by_ids(vcf, features)
     if not id_to_pos:
         print("No matching IDs found in the VCF.", file=sys.stderr)
-        sys.exit(0)
+        return []
 
     print("Loading GFF...", file=sys.stderr)
-    genes = load_gff(args.gff, molas=args.molas)
+    genes = load_gff(gff, molas=molas)
     print("Indexing genes/mRNA entries...", file=sys.stderr)
     chrom_map = group_genes_for_updown_search(genes)
 
-    out_handle = open(args.output, 'w') if args.output else sys.stdout
+    out_handle = open(output, 'w') if output else sys.stdout
 
     print("Variant_ID\tmodel\tfold\tpc\tn_snps\tGene_ID\tGene_Name\tChrom\tGene_Start\tGene_End\tStrand\timportance",
           file=out_handle)
@@ -344,12 +323,11 @@ def main():
             )
             all_genes_for_printing.append(gene_dict['gene_id'])
 
-    if args.output:
+    if output:
         out_handle.close()
 
     print("\nDone annotating. Gene IDs found:", file=sys.stderr)
-    for gid in sorted(set(all_genes_for_printing)):
+    unique_genes = sorted(set(all_genes_for_printing))
+    for gid in unique_genes:
         print(gid, file=sys.stderr)
-
-if __name__ == "__main__":
-    main()
+    return unique_genes

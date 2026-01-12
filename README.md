@@ -9,7 +9,7 @@ The pipeline writes everything under `output_dir` (default: `DGBreeding`).
 - `02_Variant_Calling/`: DeepVariant per-sample `*.vcf.gz`/`*.g.vcf.gz`, `gvcf.list`, `cohort.merged.vcf.gz`, `cohort.filtered.vcf.gz`, `cohort.filtered.ldpruned.vcf.gz` (optional), logs.
 - `evaluation/`: FastQC/MultiQC reports, Kraken2 summaries, mapping-yield CSV/plots, variant stats, circos plots.
 - `<prediction_output_dir>/`: prediction outputs (relative to `output_dir`; default in config: `prediction/`), including:
-  - `PCA_Scree_Plot/` (PCA plots/scree)
+  - `evaluation/PCA_Scree_Plot/` (PCA plots/scree)
   - `GWAS_dir/` (per-fold inputs/outputs, BLINK logs, Manhattan/QQ plots)
   - `Model_result/` (metrics CSVs, probabilities/test labels `.npy`)
   - `Shap_dir/` (SHAP plots/feature importance CSVs)
@@ -56,7 +56,7 @@ Core steps (`step=1-5` in config):
         |
         | [4] BLINK GWAS + PCA (uses phenotype CSV + VCF + chromosome mapping)
         v
-    <prediction_output_dir>/GWAS_dir + PCA_Scree_Plot
+    <prediction_output_dir>/GWAS_dir + evaluation/PCA_Scree_Plot
         |
         | [5] SNP prediction models + SHAP + ROC/AUC
         v

@@ -19,9 +19,10 @@ Unrelated parts (PCA, GWAS running, model training, CV loops) are NOT implemente
 import os
 from typing import List
 
+import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
-from Utils.utils import _resolve_outdir, parse_int_list, _open_text_maybe_gz
+from Utils.utils import _resolve_outdir, parse_int_list, _open_text_maybe_gz, encode_phenotype_series
 
 
 class SNP_numerical:
@@ -111,6 +112,20 @@ class SNP_numerical:
         )
         genotype_numeric_df = genotype_numeric_df.astype(float)
 
+        all_missing = genotype_numeric_df.isna().all(axis=0)
+        if all_missing.any():
+            missing_cols = genotype_numeric_df.columns[all_missing]
+            preview = ", ".join(missing_cols[:10])
+            suffix = " ..." if len(missing_cols) > 10 else ""
+            print(
+                "Warning: {0} variants have all missing values; dropping them. "
+                "Example: {1}{2}".format(len(missing_cols), preview, suffix)
+            )
+            genotype_numeric_df = genotype_numeric_df.loc[:, ~all_missing]
+
+        if genotype_numeric_df.shape[1] == 0:
+            raise ValueError("All variants are missing; cannot impute genotypes.")
+
         imputer = SimpleImputer(strategy='median')
         genotype_imputed = pd.DataFrame(
             imputer.fit_transform(genotype_numeric_df),
@@ -144,6 +159,10 @@ class SNP_numerical:
 
         phenotype_df = pd.read_csv(self.phenotype_csv_path, sep=None, engine='python')
         phenotype_df = phenotype_df[['taxa', self.phenotype_column]]
+        phenotype_df[self.phenotype_column], _ = encode_phenotype_series(
+            phenotype_df[self.phenotype_column],
+            log_prefix="Model phenotype",
+        )
         phenotype_df.set_index('taxa', inplace=True)
 
         train_genotype_df = self.vcf_to_dataframe(vcf_file)
@@ -169,4 +188,3 @@ class SNP_numerical:
         test_selected_snps.to_csv(test_csv_path, index_label='taxa')
 
         return top_snps
-

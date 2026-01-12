@@ -2,16 +2,25 @@
 # -*- coding: utf-8 -*-
 
 import gzip
-import subprocess as sbp
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 from pycirclize import Circos
 
-from Utils.utils import _append_log_line, call_log, time_stamp, _resolve_outdir, setup_eval_env
+from Utils.utils import (
+    _append_log_line,
+    _load_chromosome_recode,
+    _optional_int,
+    _resolve_outdir,
+    fasta_lengths,
+    setup_eval_env,
+    time_stamp,
+)
 
 
 def _format_bp(x: int) -> str:
@@ -37,6 +46,26 @@ def _fixed_ticks(seq_len: int, step_bp: Optional[int] = None):
     if labels:
         labels[0] = "0 Mb"
     return pos, labels
+
+
+def _add_track_yticks(track, tick_max: float) -> None:
+    if tick_max <= 0:
+        return
+    ticks = [0.0, tick_max / 2.0, tick_max]
+    labels = [str(int(round(t))) for t in ticks]
+    yticks = getattr(track, "yticks", None)
+    if yticks is None:
+        return
+    try:
+        yticks(ticks, labels=labels, label_size=7, tick_length=0.8)
+    except TypeError:
+        try:
+            yticks(ticks, labels=labels)
+        except TypeError:
+            try:
+                yticks(ticks)
+            except Exception:
+                return
 
 
 def make_circos_for_vcf(
@@ -103,6 +132,7 @@ def make_circos_for_vcf(
     palette = ["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974", "#64b5cd"]
     chr_name2color = {ch: palette[i % len(palette)] for i, ch in enumerate(chr_names)}
 
+    first_sector = circos.sectors[0] if circos.sectors else None
     for sector in circos.sectors:
         chrom = sector.name
         data = binned.get(chrom)
@@ -159,6 +189,8 @@ def make_circos_for_vcf(
                 color="#de425b",
                 ec="none",
             )
+        if sector == first_sector:
+            _add_track_yticks(var_track, var_cap)
 
         gene_cap = float(global_gene_max or 1)
         gene_track = sector.add_track((70, 80), r_pad_ratio=0.05)
@@ -173,28 +205,21 @@ def make_circos_for_vcf(
                 color="#4c9f50",
                 ec="none",
             )
+        if sector == first_sector:
+            _add_track_yticks(gene_track, gene_cap)
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    circos.savefig(str(out_png), dpi=int(dpi))
-
-
-def fasta_lengths(fa: Path) -> Dict[str, int]:
-    lens: Dict[str, int] = {}
-    opn = gzip.open if str(fa).endswith(".gz") else open
-    with opn(fa, "rt", errors="replace") as f:
-        name = None
-        size = 0
-        for ln in f:
-            if ln.startswith(">"):
-                if name:
-                    lens[name] = size
-                name = ln[1:].split()[0]
-                size = 0
-            else:
-                size += len(ln.strip())
-        if name:
-            lens[name] = size
-    return lens
+    legend_handles = [
+        Patch(facecolor="#de425b", label="Variant density"),
+        Patch(facecolor="#4c9f50", label="Gene density"),
+    ]
+    if hasattr(circos, "plotfig"):
+        fig = circos.plotfig()
+        fig.legend(handles=legend_handles, loc="upper right", frameon=False)
+        fig.savefig(str(out_png), dpi=int(dpi))
+        plt.close(fig)
+    else:
+        circos.savefig(str(out_png), dpi=int(dpi))
 
 
 def gff_gene_starts(gff: Path, include_biotype: Optional[str]) -> Dict[str, List[int]]:
@@ -241,31 +266,72 @@ def vcf_positions(vcf: Path) -> Dict[str, List[int]]:
     return pos
 
 
-def _load_chromosome_recode(chromosome_csv_path: Optional[Path]) -> Dict[str, str]:
-    if not chromosome_csv_path:
-        return {}
-    path = Path(chromosome_csv_path)
-    if not path.exists():
-        return {}
+def _write_chrom_stats(
+    vcf: Path,
+    out_stats: Path,
+    *,
+    contig_lengths: Dict[str, int],
+    label_map: Optional[Dict[str, str]] = None,
+    allowed_contigs: Optional[Set[str]] = None,
+    contig_order: Optional[List[str]] = None,
+    filtered_vcf: Optional[Path] = None,
+) -> Dict[str, object]:
+    counts: Dict[str, int] = defaultdict(int)
+    total = 0
+    out_stats.parent.mkdir(parents=True, exist_ok=True)
+
+    opn = gzip.open if str(vcf).endswith(".gz") else open
+    vcf_out = None
+    if filtered_vcf:
+        filtered_vcf.parent.mkdir(parents=True, exist_ok=True)
+        vcf_out = open(filtered_vcf, "w")
     try:
-        mapping = pd.read_csv(path)
-    except Exception:
-        return {}
-    if "OriginalName" not in mapping.columns or "Label" not in mapping.columns:
-        return {}
-    return dict(
-        zip(
-            mapping["OriginalName"].astype(str),
-            mapping["Label"].astype(str),
-        )
-    )
+        with opn(vcf, "rt", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    if vcf_out:
+                        vcf_out.write(line)
+                    continue
+                chrom = line.split("\t", 1)[0]
+                if allowed_contigs and chrom not in allowed_contigs:
+                    continue
+                counts[chrom] += 1
+                total += 1
+                if vcf_out:
+                    vcf_out.write(line)
+    finally:
+        if vcf_out:
+            vcf_out.close()
+
+    if contig_order:
+        order = [c for c in contig_order if not allowed_contigs or c in allowed_contigs]
+    elif allowed_contigs:
+        order = sorted(list(allowed_contigs))
+    else:
+        order = sorted(counts.keys())
+
+    with open(out_stats, "w") as out:
+        out.write(f"#total_snps={total}\n")
+        out.write("chrom\tlabel\tlength_bp\tsnp_count\tsnp_density_per_mb\n")
+        for chrom in order:
+            if allowed_contigs and chrom not in allowed_contigs:
+                continue
+            snps = counts.get(chrom, 0)
+            length = contig_lengths.get(chrom, 0)
+            label = label_map.get(chrom, chrom) if label_map else chrom
+            if length:
+                density = snps * 1_000_000.0 / length
+                out.write(f"{chrom}\t{label}\t{length}\t{snps}\t{density:.6f}\n")
+            else:
+                out.write(f"{chrom}\t{label}\tNA\t{snps}\tNA\n")
+
+    return {"total_snps": total, "contigs": len(order)}
 
 
 def prepare_circos_reference(
     ref_fasta: Optional[Path],
     gff: Optional[Path],
     gff_biotype: Optional[str],
-    target_seq: Optional[int],
     allowed_chroms: Optional[Set[str]],
     recode_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[bool, Dict[str, int], Dict[str, List[int]], Dict[str, str], List[Tuple[str, int]]]:
@@ -273,9 +339,7 @@ def prepare_circos_reference(
         return False, {}, {}, {}, []
 
     fasta_lens_raw = fasta_lengths(ref_fasta)
-    if target_seq:
-        ordered = sorted(fasta_lens_raw.items(), key=lambda kv: kv[1], reverse=True)[: target_seq or 0]
-    elif allowed_chroms:
+    if allowed_chroms:
         ordered = [(k, v) for k, v in fasta_lens_raw.items() if k in allowed_chroms]
     else:
         ordered = sorted(fasta_lens_raw.items(), key=lambda kv: kv[1], reverse=True)
@@ -286,13 +350,15 @@ def prepare_circos_reference(
     used_labels: Set[str] = set()
     rename_map: Dict[str, str] = {}
     for i, (name, _) in enumerate(ordered):
-        candidate = recode_map.get(name) if recode_map else None
-        if not candidate or candidate in used_labels:
+        if recode_map:
+            candidate = recode_map.get(name) or name
+        else:
             candidate = f"chr{i+1}"
+        base_label = str(candidate)
         suffix = 1
         while candidate in used_labels:
             suffix += 1
-            candidate = f"chr{i+1}_{suffix}"
+            candidate = f"{base_label}_{suffix}"
         rename_map[name] = candidate
         used_labels.add(candidate)
     fasta_lens = {rename_map[name]: length for name, length in ordered}
@@ -303,69 +369,41 @@ def prepare_circos_reference(
     return True, fasta_lens, gene_starts, rename_map, ordered
 
 
-def _optional_int(val, default=None, none_if_blank: bool = True):
-    if val in (None, "", False):
-        return None if none_if_blank else default
-    try:
-        iv = int(val)
-    except (TypeError, ValueError):
-        return default
-    if none_if_blank and iv == 0:
-        return None
-    return iv
-
-
 class VariantCircosEvaluator:
     """
     Step 3: Variant stats + Circos (gene + variant density).
     """
 
     def __init__(self, args):
-        self.threads   = int(getattr(args, "threads", 1))
         self.outdir    = _resolve_outdir(base_outdir=getattr(args, "outdir", "."), resolve=True)
         self.variant_dir = _resolve_outdir(base_outdir=getattr(args, "variant_outdir", self.outdir), resolve=True)
         self.ref_fasta = Path(getattr(args, "ref_fasta", "")).expanduser().resolve() if getattr(args, "ref_fasta", None) else None
         self.gff       = Path(getattr(args, "gff", "")).expanduser().resolve() if getattr(args, "gff", None) else None
-        chrom_raw = (getattr(args, "chromosome_csv_path", "") or "").strip()
+        chrom_raw = getattr(args, "chromosome_csv_path", "")
+        if isinstance(chrom_raw, Path):
+            chrom_raw = str(chrom_raw)
+        chrom_raw = (chrom_raw or "").strip()
         self.chromosome_csv_path = Path(chrom_raw).expanduser().resolve() if chrom_raw else None
 
-        self.tmp_dir, self.mpl_config_dir, self.report_dir = setup_eval_env(self.outdir)
+        _, _, self.report_dir = setup_eval_env(self.outdir)
 
         self.gff_biotype   = getattr(args, "gff_biotype", None)
         self.circos_window = _optional_int(getattr(args, "circos_window", None), default=10000, none_if_blank=False) or 10000
         self.circos_tick_step = _optional_int(getattr(args, "circos_tick_step", None), default=None, none_if_blank=True)
-        self.circos_chroms = list(getattr(args, "circos_chroms", []) or [])
-        try:
-            self.target_seq  = int(getattr(args, "target_seq", 0))
-        except Exception:
-            self.target_seq  = 0
-
         # report_dir already created by setup_eval_env
-
-    @staticmethod
-    def _bcftools_stats_one(vcf: Path, stats_out: Path) -> Optional[Dict]:
-        stats_out.parent.mkdir(parents=True, exist_ok=True)
-        cmd = f"bcftools stats -s - {vcf} > {stats_out}"
-        try:
-            sbp.run(cmd, shell=True, check=True, stdout=sbp.DEVNULL, stderr=sbp.DEVNULL)
-        except sbp.CalledProcessError:
-            call_log(stats_out.parent, "bcftools_stats", cmd)
-            return None
 
     def evaluate_variants(self) -> pd.DataFrame:
         if not self.variant_dir.exists():
             time_stamp(f"[variants] variant_dir not found: {self.variant_dir}")
             return pd.DataFrame()
 
-        allowed_chroms = set(self.circos_chroms) if self.circos_chroms else None
-        max_chroms = self.target_seq if self.target_seq and self.target_seq > 0 else None
-
         recode_map = _load_chromosome_recode(self.chromosome_csv_path)
+        ref_lengths = fasta_lengths(self.ref_fasta) if (self.ref_fasta and self.ref_fasta.exists()) else {}
+        allowed_chroms = set(recode_map.keys()) if recode_map else None
         do_circos, fasta_lens, gene_starts, rename_map, contig_order = prepare_circos_reference(
             ref_fasta=self.ref_fasta,
             gff=self.gff,
             gff_biotype=self.gff_biotype,
-            target_seq=max_chroms,
             allowed_chroms=allowed_chroms,
             recode_map=recode_map,
         )
@@ -385,6 +423,8 @@ class VariantCircosEvaluator:
         stats_dir = self.report_dir / "variant_stats"
         circos_dir = self.report_dir / "variant_circos"
         circos_dir.mkdir(parents=True, exist_ok=True)
+        contigs_filter = set(recode_map.keys()) if recode_map else set()
+        contig_order_names = [name for name, _ in contig_order] if contig_order else None
         if do_circos and contig_order:
             map_path = circos_dir / "contig_name_map.tsv"
             with open(map_path, "w") as mh:
@@ -395,9 +435,29 @@ class VariantCircosEvaluator:
 
         for vcf in vcfs:
             stem = vcf.name[:-7] if str(vcf).endswith(".vcf.gz") else vcf.stem
-            rec = self._bcftools_stats_one(vcf, stats_dir / f"{stem}.stats")
-            if rec:
-                rows.append(rec)
+            summary = {"vcf": str(vcf)}
+            summary.update(
+                _write_chrom_stats(
+                    vcf,
+                    stats_dir / f"{stem}.stats",
+                    contig_lengths=ref_lengths,
+                    label_map=recode_map,
+                    allowed_contigs=None,
+                    contig_order=None,
+                )
+            )
+            if contigs_filter:
+                target_summary = _write_chrom_stats(
+                    vcf,
+                    stats_dir / f"{stem}.filtered_target_seq.stats",
+                    contig_lengths=ref_lengths,
+                    label_map=recode_map,
+                    allowed_contigs=contigs_filter,
+                    contig_order=contig_order_names,
+                    filtered_vcf=stats_dir / f"{stem}.filtered_target_seq.vcf",
+                )
+                summary["total_snps_target_seq"] = target_summary.get("total_snps", 0)
+            rows.append(summary)
 
             if do_circos:
                 vpos_raw = vcf_positions(vcf)

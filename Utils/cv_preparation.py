@@ -36,7 +36,8 @@ class CV_preparation:
                 "",
                 "Notes:",
                 "- Step 4 uses train samples to run GWAS per fold.",
-                "- Step 5 uses test samples for model prep and training.",
+                "- Step 5 uses train samples for PRS scoring.",
+                "- Step 6 uses test samples for model prep and training.",
             ]
         )
         with open(readme_path, "w") as f:

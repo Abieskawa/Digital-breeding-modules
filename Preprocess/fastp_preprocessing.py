@@ -28,11 +28,17 @@ import argparse
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 import subprocess
+# Allow running this script from outside the repo.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 from Utils.utils import discover_pairs_by_patterns
 
 R1_PATTERNS = [
     "*_1.fastq", "*_1.fq", "*_1.fastq.gz", "*_1.fq.gz",
-    "*_R1.fastq", "*_R1.fq", "*_R1.fastq.gz", "*_R1.fq.gz"
+    "*_R1.fastq", "*_R1.fq", "*_R1.fastq.gz", "*_R1.fq.gz",
+    "*_1_*.fastq", "*_1_*.fq", "*_1_*.fastq.gz", "*_1_*.fq.gz",
+    "*_R1_*.fastq", "*_R1_*.fq", "*_R1_*.fastq.gz", "*_R1_*.fq.gz",
 ]
 FASTP_MAX_THREADS = 64
 
@@ -88,7 +94,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("-l", "--min-length", type=int, default=30, help="--length_required (default: 30)")
     p.add_argument("-q", "--qualified-phred", type=int, default=20, help="Qualified base threshold Q (default: 20)")
     p.add_argument("-e", "--average-qual", type=int, default=0, help="Drop reads with avg qual < this (0=off)")
-    p.add_argument("--lib-type", choices=["DNA", "RNA"], default="DNA", help="Library type tunes defaults. If RNA, enables --trim_poly_x (default: DNA)")
+    p.add_argument(
+        "--lib-type",
+        choices=["DNA", "RNA"],
+        required=True,
+        help="Library type tunes defaults. If RNA, enables --trim_poly_x"
+    )
     p.add_argument(
         "--trim-front",
         help="Global integer (front trim) OR path to 2-col file mapping sample_key -> value",
@@ -96,7 +107,11 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--detect-adapter-pe", action="store_true",
                    help="Enable adapter detection for PE (adds --detect_adapter_for_pe)")
-    p.add_argument("--dedup", action="store_true", help="Enable fastp deduplication (--dedup)")
+    p.add_argument(
+        "--dedup",
+        action="store_true",
+        help="Enable fastp deduplication (--dedup). Not allowed with --lib-type RNA."
+    )
     p.add_argument("--report-dir", default="", help="Directory for HTML/JSON reports (default: outdir)")
     return p
 
@@ -125,11 +140,12 @@ def run_fastp(
         print(f"[warn] fastp threads must be >= 1; using 1 (requested {threads})", file=sys.stderr)
         threads = 1
     elif threads > FASTP_MAX_THREADS:
-        print(
-            f"[warn] fastp supports up to {FASTP_MAX_THREADS} threads; capping from {threads} to {FASTP_MAX_THREADS}",
-            file=sys.stderr
+        raise ValueError(
+            f"--threads exceeds max supported ({FASTP_MAX_THREADS}); got {threads}"
         )
-        threads = FASTP_MAX_THREADS
+
+    if lib_type == "RNA" and dedup:
+        raise ValueError("--dedup is not allowed for RNA libraries. Remove --dedup or use --lib-type DNA.")
 
     # parse front trimming
     per_r1: Dict[str, int] = {}

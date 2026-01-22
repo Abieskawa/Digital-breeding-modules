@@ -67,7 +67,8 @@ class GWASPCAEvaluator:
 
         df = df.sort_values(by=["chr", "pos"])
         df = df.rename(columns={"chr": "#CHROM", "pos": "POS", "p_value": "P", "taxa": "ID"})
-        df["#CHROM"] = df["#CHROM"].map(recode_dict)
+        chrom_raw = df["#CHROM"].astype(str)
+        df["#CHROM"] = chrom_raw.map(recode_dict).fillna(chrom_raw)
         df = df[df["P"] != 0]
 
         fig, ax = plt.subplots(figsize=(12, 6))

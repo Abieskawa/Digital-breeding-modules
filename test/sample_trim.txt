@@ -1,0 +1,9 @@
+# Example per-sample front-trim file for fastp_preprocessing.py
+# Format: <sample_key> <trim_bp>
+# sample_key must end with _1/_2 or _R1/_R2 and match FASTQ base name
+SRR26245751_1 8
+SRR26245751_2 6
+4202P-HPGonad_R1 12
+4202P-HPGonad_R2 12
+SampleA_1 5
+SampleA_2 5

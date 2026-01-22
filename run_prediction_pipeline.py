@@ -24,6 +24,7 @@ from Utils.bed_generator import build_capture_bed
 from Utils.utils import _resolve_outdir, _ensure_bgzip_and_index, read_config, time_stamp, parse_int_list, coerce_bool, _save_numeric_npz
 from Utils.cv_preparation import CV_preparation
 from GWAS.run_blink_gwas_pca import GWAS_PCA
+from PRS.run_prs import PRSCalculator
 from Prediction_model.model_construction import ModelConstruction
 from Prediction_model.snp_numeric_transformer import SNP_numerical
 
@@ -397,7 +398,9 @@ class PredictionPipeline(object):
         ld_prune_raw = configure.get("ld_prune", "")
         if ld_prune_raw == "":
             ld_prune_raw = configure.get("ld_pruning", "")
-        self.enable_ld_pruning = coerce_bool(ld_prune_raw, True)
+        if ld_prune_raw and not coerce_bool(ld_prune_raw, True):
+            time_stamp("[config] ld_prune disabled; forcing LD pruning on.")
+        self.enable_ld_pruning = True
         ld_method_raw = (configure.get("ld_method", "") or "").strip()
         self.ld_method = ld_method_raw or "indep"  # or indep-pairwise
         self.ld_window = _coerce_int("ld_window", configure.get("ld_window", ""), 50)
@@ -412,7 +415,7 @@ class PredictionPipeline(object):
         self.circos_tick_step = _coerce_int("circos_tick_step", configure.get("circos_tick_step", ""), 0) or None
         tag_outliers_raw = (configure.get("tag_outliers", "true") or "true").strip().lower()
         self.tag_outliers = tag_outliers_raw not in {"0", "false", "no", "off"}
-        # --- Prediction / CV knobs (used in step 4/5 CV orchestration) ---
+        # --- Prediction / CV knobs (used in step 4/5/6 CV orchestration) ---
         self.pred_vcf_file = Path((configure.get("vcf_file_path") or "").strip()).expanduser().resolve() if (configure.get("vcf_file_path") or "").strip() else None
         self.pred_pheno_csv = Path((configure.get("phenotype_csv_path") or "").strip()).expanduser().resolve() if (configure.get("phenotype_csv_path") or "").strip() else None
         self.pred_pheno_col = (configure.get("phenotype_column", "Phenotype") or "Phenotype").strip()
@@ -436,10 +439,10 @@ class PredictionPipeline(object):
             self.pred_inner_model_workers = _coerce_int("inner_model_workers", inner_model_raw, 1)
         else:
             self.pred_inner_model_workers = 0
-        if "5" in self.steps:
-            self.pred_step5_mode = "full" if "4" in self.steps else "model_only"
+        if "6" in self.steps:
+            self.pred_step6_mode = "full" if "4" in self.steps else "model_only"
         else:
-            self.pred_step5_mode = "full"
+            self.pred_step6_mode = "full"
 
     def _require_config_path(self) -> Path:
         if self.config_path is None:
@@ -468,10 +471,9 @@ class PredictionPipeline(object):
         if not self.variant_outdir.exists():
             return None
         candidates: List[Path] = []
-        if self.enable_ld_pruning:
-            candidates.append(self.variant_outdir / "cohort.filtered.ldpruned.vcf.gz")
         candidates.append(self.variant_outdir / "cohort.filtered.vcf.gz")
         candidates.append(self.variant_outdir / "cohort.merged.vcf.gz")
+        candidates.append(self.variant_outdir / "cohort.filtered.ldpruned.vcf.gz")
         for cand in candidates:
             if cand.exists():
                 return cand
@@ -585,8 +587,7 @@ class PredictionPipeline(object):
         for fold_cfg_path in fold_configs:
             fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
             config = read_config(fold_cfg["config_file"])
-            if not config.get("vcf_file_path"):
-                config["vcf_file_path"] = str(self.pred_vcf_file)
+            config["vcf_file_path"] = str(self.pred_vcf_file)
             file_fold_index = str(fold_cfg["file_fold_index"])
             gwas_pcs_raw = str(fold_cfg.get("gwas_pcs", "") or "")
             pca_n_components = CV_preparation.parse_optional_int(fold_cfg.get("pca_n_components"))
@@ -623,13 +624,13 @@ class PredictionPipeline(object):
                 finished.append(fut.result())
         time_stamp(f"[step4] Completed jobs: {len(finished)}")
 
-    def _run_prediction_cv_step5(self) -> None:
+    def _run_prediction_cv_step6(self) -> None:
         """
-        Step 5: CV orchestration (pipeline-level jobs) for model prep + training.
+        Step 6: CV orchestration (pipeline-level jobs) for model prep + training.
         """
         repo_root = Path(__file__).resolve().parent
 
-        if self.pred_step5_mode == "model_only":
+        if self.pred_step6_mode == "model_only":
             cv_config_dir = self.prediction_outdir / "cv_configs"
             if not cv_config_dir.exists():
                 raise FileNotFoundError(
@@ -652,9 +653,9 @@ class PredictionPipeline(object):
                     )
                 )
 
-            time_stamp(f"[step5] mode=model_only: {len(jobs)} model jobs queued from {cv_config_dir}")
+            time_stamp(f"[step6] mode=model_only: {len(jobs)} model jobs queued from {cv_config_dir}")
             if not jobs:
-                time_stamp("[step5] No model jobs to run.")
+                time_stamp("[step6] No model jobs to run.")
                 return
 
             finished: List[str] = []
@@ -670,12 +671,12 @@ class PredictionPipeline(object):
                 for fut in as_completed(futs):
                     finished.append(fut.result())
 
-            time_stamp(f"[step5] Completed jobs: {len(finished)}")
+            time_stamp(f"[step6] Completed jobs: {len(finished)}")
             return
 
         fold_configs = self._prepare_prediction_cv_configs(create_if_missing=False)
 
-        time_stamp(f"[step5] CV fold configs ready: {len(fold_configs)} folds")
+        time_stamp(f"[step6] CV fold configs ready: {len(fold_configs)} folds")
         jobs = []
         for fold_cfg_path in fold_configs:
             jobs.extend(
@@ -687,9 +688,9 @@ class PredictionPipeline(object):
                 )
             )
 
-        time_stamp(f"[step5] Model jobs queued: {len(jobs)}")
+        time_stamp(f"[step6] Model jobs queued: {len(jobs)}")
         if not jobs:
-            time_stamp("[step5] No model jobs to run.")
+            time_stamp("[step6] No model jobs to run.")
             return
 
         finished: List[str] = []
@@ -704,7 +705,7 @@ class PredictionPipeline(object):
             futs = [ex.submit(_cv_model_train_worker, j) for j in jobs]
             for fut in as_completed(futs):
                 finished.append(fut.result())
-        time_stamp(f"[step5] Completed jobs: {len(finished)}")
+        time_stamp(f"[step6] Completed jobs: {len(finished)}")
 
         # Summarize metrics (replicates cat_result behavior; avoids re-running training)
         model_dir = self.prediction_outdir / "Model_result"
@@ -717,7 +718,32 @@ class PredictionPipeline(object):
                 mean_df = combined.groupby(["n_pcs", "n_snps", "model_name"])[["accuracy", "specificity", "mcc", "f1_score"]].mean().reset_index()
                 combined.to_csv(self.prediction_outdir / "model_evaluation_results_all.csv", index=False)
                 mean_df.to_csv(self.prediction_outdir / "model_evaluation_results_mean.csv", index=False)
-                time_stamp("[step5] Wrote model_evaluation_results_all.csv and model_evaluation_results_mean.csv")
+                time_stamp("[step6] Wrote model_evaluation_results_all.csv and model_evaluation_results_mean.csv")
+
+    def _run_prediction_prs_step5(self) -> None:
+        """
+        Step 5: PRS scoring per CV fold (post-GWAS).
+        """
+        self._require_prediction_inputs()
+        fold_configs = self._prepare_prediction_cv_configs(create_if_missing=False)
+
+        time_stamp(f"[step5] CV fold configs ready: {len(fold_configs)} folds")
+        prs_tool = PRSCalculator(self.config)
+
+        for fold_cfg_path in fold_configs:
+            fold_cfg = CV_preparation.read_fold_config(fold_cfg_path)
+            file_fold_index = str(fold_cfg["file_fold_index"])
+            gwas_pcs_raw = str(fold_cfg.get("gwas_pcs", "") or self.pred_gwas_pcs)
+            pcs = parse_int_list(gwas_pcs_raw) if gwas_pcs_raw.strip() else [0]
+
+            train_samples = CV_preparation.read_samples_file(Path(fold_cfg["train_samples_file"]))
+
+            prs_tool.run_fold(
+                file_fold_index,
+                pcs,
+                train_samples=train_samples,
+            )
+        time_stamp("[step5] PRS scoring complete")
 
     def _run_core_step(self, step_id: str) -> None:
         if step_id == "1":
@@ -744,11 +770,11 @@ class PredictionPipeline(object):
             time_stamp("Finished aligning DNA reads to reference genome")
             return
         if step_id == "3":
-            time_stamp("Step 3: Running DeepVariant + GLnexus + plink")
+            time_stamp("Step 3: Running DeepVariant + GLnexus + plink2")
             self._prepare_capture_bed()
             # Pass self directly; VariantCalling reads attributes it needs and uses defaults for the rest
             VariantCalling(self).run_all()
-            time_stamp("Finished DeepVariant + GLnexus + plink")
+            time_stamp("Finished DeepVariant + GLnexus + plink2")
             return
         if step_id == "4":
             time_stamp("Step 4: Running BLINK GWAS/PCA (per CV fold)")
@@ -756,8 +782,13 @@ class PredictionPipeline(object):
             time_stamp("Finished BLINK GWAS/PCA")
             return
         if step_id == "5":
-            time_stamp("Step 5: Running SNP prediction model (CV orchestration in pipeline)")
-            self._run_prediction_cv_step5()
+            time_stamp("Step 5: Running PRS scoring (post-GWAS)")
+            self._run_prediction_prs_step5()
+            time_stamp("Finished PRS scoring")
+            return
+        if step_id == "6":
+            time_stamp("Step 6: Running SNP prediction model (CV orchestration in pipeline)")
+            self._run_prediction_cv_step6()
             time_stamp("Finished SNP prediction model (CV orchestration)")
             return
         raise ValueError(f"Unknown core step: {step_id}")
@@ -817,7 +848,10 @@ class PredictionPipeline(object):
                     fut.result()
             return
         if step_id == "5":
-            time_stamp("[eva5] Prediction ROC/AUC plots")
+            time_stamp("[eva5] PRS evaluation is not implemented.")
+            return
+        if step_id == "6":
+            time_stamp("[eva6] Prediction ROC/AUC plots")
             evaluator = RocShapEvaluator(self.config)
             probabilities_files = [
                 f for f in os.listdir(evaluator.model_output_dir) if f.startswith("Probabilities")
@@ -866,7 +900,7 @@ class PredictionPipeline(object):
         # Evaluation step 0 can run before any analysis
         self._run_eval_step("0")
 
-        for step_id in ("1", "2", "3", "4", "5"):
+        for step_id in ("1", "2", "3", "4", "5", "6"):
             if step_id in steps_to_run:
                 self._run_core_step(step_id)
             self._run_eval_step(step_id)

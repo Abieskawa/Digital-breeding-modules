@@ -12,7 +12,7 @@ Outputs (you may request any combination):
   --merge-expression   merge and process per-mode tables into a single expression table (FPKM/TPM/counts)
 Each output mode writes into its own directory under --out-dir; per-sample count matrices are placed at --out-dir.
 """
-import argparse, subprocess, glob, os, sys, math
+import argparse, subprocess, glob, os, sys, math, re
 
 # ---------- helpers ----------
 
@@ -108,14 +108,20 @@ def main():
     r1_files = sorted(set(fastq1 + fq1))
     samples = []
     for r1 in r1_files:
-        r2 = r1.replace('1.cleaned', '2.cleaned')
+        base = os.path.basename(r1)
+        m = re.match(r'^(?P<sample>.+?)(?P<mate>_R1|_1)\.cleaned\.(?P<ext>f(?:ast)?q(?:\.gz)?)$', base)
+        if not m:
+            print(f"Skipping unrecognized FASTQ name: {base}", flush=True)
+            continue
+        sample = m.group('sample').replace('-', '_')  # avoid prepDE mis-parsing -G in sample IDs
+        r2 = os.path.join(args.reads_dir, f"{m.group('sample')}{m.group('mate').replace('1','2')}.cleaned.{m.group('ext')}")
         paired = os.path.exists(r2)
-        sample = os.path.basename(r1).split('1.cleaned')[0]    
         if not paired:
             print(f"Single-end sample for {sample}, no R2 found: {r2}", flush=True)
         samples.append(sample)
 
-        pref = os.path.join(align_dir, sample + '.')
+        # Use an underscore suffix to avoid STAR's ._STARpass1 naming that confuses MultiQC.
+        pref = os.path.join(align_dir, sample + '_')
         bam  = pref + 'Aligned.sortedByCoord.out.bam'
         if not os.path.exists(bam):
             cmd = [

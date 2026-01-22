@@ -14,8 +14,8 @@ class VariantCalling:
     Steps:
       1) DeepVariant (Docker) per-sample → per-sample VCF + gVCF
       2) GLnexus joint-call → cohort.merged.vcf.gz (+.tbi)
-      3) plink QC → cohort.filtered.vcf.gz (+.tbi)
-      4) plink LD-prune → cohort.filtered.ldpruned.vcf.gz (+.tbi) [optional]
+      3) plink2 QC (+MAF) → cohort.filtered.vcf.gz (+.tbi)
+      4) plink2 LD-prune → cohort.filtered.ldpruned.vcf.gz (+.tbi)
       5) pigz archive BAMs
 
     Required args:
@@ -26,7 +26,7 @@ class VariantCalling:
         capture_bed=None
         hwe_p='1e-5'
         geno_missing='0.10'
-        enable_ld_pruning=True
+        maf=0.05
         ld_method='indep'        # or 'indep-pairwise'
         ld_window=50
         ld_step=5
@@ -51,11 +51,23 @@ class VariantCalling:
 
         self.hwe_p        = str(getattr(args, 'hwe_p', '1e-5'))
         self.geno_missing = str(getattr(args, 'geno_missing', '0.10'))
+        maf_raw = getattr(args, 'maf', None)
+        try:
+            self.maf = float(maf_raw) if maf_raw not in (None, "", False) else 0.05
+        except (TypeError, ValueError):
+            self.maf = 0.05
+        if not (0.0 < self.maf < 0.5):
+            time_stamp(f"[variant] Invalid maf={self.maf}; using default 0.05")
+            self.maf = 0.05
 
         ld_prune_raw = getattr(args, 'enable_ld_pruning', None)
         if ld_prune_raw is None:
             ld_prune_raw = getattr(args, 'ld_prune', None)
-        self.enable_ld_pruning = coerce_bool(ld_prune_raw, True)
+        if ld_prune_raw is None:
+            ld_prune_raw = getattr(args, 'ld_pruning', None)
+        if ld_prune_raw is not None and not coerce_bool(ld_prune_raw, True):
+            time_stamp("[variant] LD pruning disabled in config; forcing enabled.")
+        self.enable_ld_pruning = True
 
         self.ld_method = str(getattr(args, 'ld_method', 'indep'))
         self.ld_window = int(getattr(args, 'ld_window', 50))
@@ -168,33 +180,34 @@ class VariantCalling:
                   step='tabix_index', logdir=self.variant_outdir)
         return merged_vcf
 
-    # ---------------- plink QC ----------------
+    # ---------------- plink2 QC ----------------
 
     def plink_qc(self, input_vcf: Path, out_prefix: str = 'cohort.filtered') -> Path:
         out_base = self.variant_outdir / out_prefix
         raw_vcf, gz_vcf = self._vcf_paths(out_base)
 
         cmd = (
-            f"plink --vcf {input_vcf} "
+            f"plink2 --vcf {input_vcf} "
             "--vcf-half-call missing "
             "--allow-extra-chr "
             "--snps-only just-acgt "
             "--biallelic-only strict "
             f"--geno {self.geno_missing} "
+            f"--maf {self.maf} "
             f"--hwe {self.hwe_p} midp "
             f"--threads {self.threads} "
-            "--recode vcf "
+            "--export vcf "
             f"--out {out_base}"
         )
         run_quiet(cmd, step='plink_qc', logdir=self.variant_outdir)
         if not raw_vcf.exists():
-            raise RuntimeError(f"plink did not produce expected VCF: {raw_vcf}")
+            raise RuntimeError(f"plink2 did not produce expected VCF: {raw_vcf}")
         run_quiet(f'bgzip -f {raw_vcf}', step='bgzip_qc_vcf', logdir=self.variant_outdir)
         run_quiet(f'tabix -p vcf {gz_vcf}',
                   step='tabix_index', logdir=self.variant_outdir)
         return gz_vcf
 
-    # ---------------- plink LD-pruning ----------------
+    # ---------------- plink2 LD-pruning ----------------
 
     def ld_prune(self, input_vcf: Path, out_prefix: str = 'cohort.filtered.ldpruned') -> Path:
         prune_prefix = self.variant_outdir / 'ldprune'
@@ -205,7 +218,7 @@ class VariantCalling:
             indep_flag = f"--indep {self.ld_window} {self.ld_step} {self.ld_param}"
 
         cmd_indep = (
-            f"plink --vcf {input_vcf} "
+            f"plink2 --vcf {input_vcf} "
             "--allow-extra-chr "
             f"{indep_flag} "
             f"--threads {self.threads} "
@@ -215,21 +228,21 @@ class VariantCalling:
 
         prune_in = prune_prefix.with_suffix('.prune.in')
         if not prune_in.exists():
-            raise RuntimeError('plink did not produce prune.in')
+            raise RuntimeError('plink2 did not produce prune.in')
 
         out_base   = self.variant_outdir / out_prefix
         raw_vcf, pruned_vcf = self._vcf_paths(out_base)
 
         cmd_export = (
-            f"plink --vcf {input_vcf} "
+            f"plink2 --vcf {input_vcf} "
             "--allow-extra-chr "
             f"--extract {prune_in} "
-            "--recode vcf "
+            "--export vcf "
             f"--out {out_base}"
         )
         run_quiet(cmd_export, step='plink_export', logdir=self.variant_outdir)
         if not raw_vcf.exists():
-            raise RuntimeError(f"plink did not produce expected VCF: {raw_vcf}")
+            raise RuntimeError(f"plink2 did not produce expected VCF: {raw_vcf}")
         run_quiet(f'bgzip -f {raw_vcf}', step='bgzip_ld_vcf', logdir=self.variant_outdir)
         run_quiet(f'tabix -p vcf {pruned_vcf}',
                   step='tabix_index', logdir=self.variant_outdir)
@@ -262,6 +275,5 @@ class VariantCalling:
 
         merged   = self.joint_call_glnexus()
         filtered = self.plink_qc(merged, out_prefix='cohort.filtered')
-        if self.enable_ld_pruning:
-            _pruned  = self.ld_prune(filtered, out_prefix='cohort.filtered.ldpruned')
+        _pruned  = self.ld_prune(filtered, out_prefix='cohort.filtered.ldpruned')
         _archive = self.pigz_archive_bams()

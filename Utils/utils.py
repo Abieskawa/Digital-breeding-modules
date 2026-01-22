@@ -1,6 +1,7 @@
 # Utils/utils.py
 import gzip
 import os
+import re
 import numpy as np
 import shutil
 import subprocess as sbp
@@ -122,12 +123,11 @@ def _load_chromosome_recode(chromosome_csv_path: Optional[Path], *, required: bo
         return {}
     import pandas as pd
     mapping = pd.read_csv(path, sep=None, engine="python", comment="#")
-    return dict(
-        zip(
-            mapping["OriginalName"].astype(str),
-            mapping["Label"].astype(str),
-        )
-    )
+    labels = mapping["Label"].astype(str)
+    recode = dict(zip(mapping["OriginalName"].astype(str), labels))
+    if "RecodedNumber" in mapping.columns:
+        recode.update(dict(zip(mapping["RecodedNumber"].astype(str), labels)))
+    return recode
 
 def _optional_int(val, default=None, none_if_blank: bool = True):
     if val in (None, "", False):
@@ -385,6 +385,8 @@ R1_PATTERNS_CLEANED = [
 R1_PATTERNS_RAW = [
     "*_1.fastq", "*_1.fq", "*_1.fastq.gz", "*_1.fq.gz",
     "*_R1.fastq", "*_R1.fq", "*_R1.fastq.gz", "*_R1.fq.gz",
+    "*_1_*.fastq", "*_1_*.fq", "*_1_*.fastq.gz", "*_1_*.fq.gz",
+    "*_R1_*.fastq", "*_R1_*.fq", "*_R1_*.fastq.gz", "*_R1_*.fq.gz",
 ]
 
 
@@ -395,6 +397,7 @@ def _discover_pairs(
     require_r2: bool,
     sort_paths: bool = True,
 ) -> List[Tuple[str, str, Path, Optional[Path]]]:
+    r1_token_re = re.compile(r"^(.*)(_R1|_1)([._].+)$")
     wd = Path(wd)
     seen = set()
     pairs: List[Tuple[str, str, Path, Optional[Path]]] = []
@@ -402,16 +405,16 @@ def _discover_pairs(
         it = sorted(wd.glob(pat)) if sort_paths else wd.glob(pat)
         for r1p in it:
             fname = r1p.name
-            if "_R1." in fname:
-                base, ext = fname.split("_R1.", 1)
-                r2n = f"{base}_R2.{ext}"
-                style = "R"
-            elif "_1." in fname:
-                base, ext = fname.split("_1.", 1)
-                r2n = f"{base}_2.{ext}"
-                style = "1"
-            else:
+            m = r1_token_re.match(fname)
+            if not m:
                 continue
+            base, token, rest = m.groups()
+            if token == "_R1":
+                r2n = f"{base}_R2{rest}"
+                style = "R"
+            else:
+                r2n = f"{base}_2{rest}"
+                style = "1"
             r2p = wd / r2n
             if require_r2 and not r2p.exists():
                 print(f"[info] Skip {fname}: missing pair {r2n}", file=sys.stderr)

@@ -45,14 +45,12 @@ bed_require_genes=true   # set true for gene-only (requires gff=...)
 # bed_gene_biotype=        # optional; leave blank to keep any gene biotype
 # bed_output=              # optional; default: 02_Variant_Calling/glnexus.capture.bed
 
-# PLINK quality filtration
+# PLINK2 quality filtration (always applied)
 hwe_p=1e-5
 geno_missing=0.10
 
-# LD pruning (set ld_prune=true to enable)
-ld_prune=false
 # ld_method=indep-pairwise or indep
-# LD-pruning parameters (used only when ld_prune=true)
+# LD-pruning parameters (always applied)
 ld_method=indep
 ld_window=50
 ld_step=5
@@ -89,6 +87,9 @@ data_type=binary # binary, multiclass, regression
 
 # Top N SNPs settings
 top_n_snps_list=10,50  # List of top N SNPs to test, separated by commas
+
+# Step 5: PRS scoring (train samples only)
+prs_top_n_snps_list=1-10,11-20,21-50  # PRS rank bins (range format only)
 
 # Models to evaluate
 models=MLP,SVM,RandomForest,XGBoost  # List of models to test, separated by commas #Avalable model: MLP,SVM,RandomForest,XGBoost

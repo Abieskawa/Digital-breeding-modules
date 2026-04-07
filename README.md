@@ -11,6 +11,7 @@ The pipeline writes everything under `output_dir` (default: `DGBreeding`).
 - `<prediction_output_dir>/`: prediction outputs (relative to `output_dir`; default in config: `prediction/`), including:
   - `evaluation/PCA_Scree_Plot/` (PCA plots/scree)
   - `GWAS_dir/` (per-fold inputs/outputs, BLINK logs, Manhattan/QQ plots)
+  - `PRS_dir/` (per-fold PRS train/test scores and train-derived weights)
   - `Model_result/` (metrics CSVs, probabilities/test labels `.npy`)
   - `Shap_dir/` (SHAP plots/feature importance CSVs)
   - `AUC_dir/` (ROC/AUC comparison plots + `auc_summary.csv`)
@@ -20,6 +21,9 @@ The Docker image builds two separate conda environments using micromamba:
 
 - `DGbreeding-biotools`: alignment/variant calling/QC (fastp, bwa-mem2, samtools, bcftools, glnexus, plink2, etc.)
 - `DGbreeding-ml`: model training/inference (numpy, pandas, scikit-learn, xgboost, shap, etc.)
+
+RNA-seq note:
+- `fastp --dedup` is DNA-only in this project. Do not use duplicate removal when preprocessing RNA-seq libraries; use `--lib-type RNA` without `--dedup`.
 
 To construct them locally, copy the YAML specs from `Dockerfile` and run:
 
@@ -58,10 +62,10 @@ Core steps (`step=1-6` in config):
         v
     <prediction_output_dir>/GWAS_dir + evaluation/PCA_Scree_Plot
         |
-        | [5] PRS scoring
-        | [6] SNP prediction models + SHAP + ROC/AUC
+        | [5] optional PRS scoring (fold-specific train/test scores; train-derived weights only)
+        | [6] prediction models + SHAP + ROC/AUC
         v
-    <prediction_output_dir>/Model_result + Shap_dir + AUC_dir
+    <prediction_output_dir>/PRS_dir + Model_result + Shap_dir + AUC_dir
 
 Evaluation steps (`eva_step=0-6` in config, can be run alongside or after core steps):
 
@@ -72,6 +76,78 @@ Evaluation steps (`eva_step=0-6` in config, can be run alongside or after core s
 - `4`: Manhattan/QQ plots -> `<prediction_output_dir>/GWAS_dir/*/manhattan_plot_*.png`, `qq_plot_*.png`
 - `5`: PRS evaluation (not implemented)
 - `6`: ROC/AUC plots -> `<prediction_output_dir>/AUC_dir/auc_comparison_*.png`, `auc_summary.csv`
+
+## Minimal Config Additions
+New prediction feature modes keep the old SNP workflow as the default:
+
+```ini
+prediction_feature_mode=baseline_snp
+```
+
+- `baseline_snp`: unchanged current behavior.
+- `prs_only`: step 6 uses only PRS columns from step 5.
+- `snp_plus_prs`: step 6 appends PRS columns onto the existing SNP matrix.
+
+Minimal DeepVariant backend/resource keys:
+
+```ini
+deepvariant_mode=auto
+deepvariant_docker_mode=true
+deepvariant_gpu_image=google/deepvariant:1.10.0-gpu
+deepvariant_cpu_image=google/deepvariant:1.10.0-beta
+gpu_devices=0
+step3_max_concurrent_samples=1
+step3_gpu_jobs=1
+step3_cpu_jobs=1
+deepvariant_num_shards=96
+```
+
+- Only DeepVariant uses GPU.
+- GLnexus, plink2, BLINK, PRS, model training, and the rest of the pipeline remain CPU-based.
+
+## Example Snippets
+Baseline SNP-only, unchanged default:
+
+```ini
+prediction_feature_mode=baseline_snp
+step=4,6
+```
+
+PRS-only experiment:
+
+```ini
+prediction_feature_mode=prs_only
+step=4,5,6
+prs_top_n_snps_list=1-10,11-20,21-50
+```
+
+SNP + PRS experiment:
+
+```ini
+prediction_feature_mode=snp_plus_prs
+step=4,5,6
+top_n_snps_list=10,50
+prs_top_n_snps_list=1-10,11-20,21-50
+```
+
+DeepVariant GPU via Docker:
+
+```ini
+deepvariant_mode=gpu
+deepvariant_docker_mode=true
+gpu_devices=0
+step3_gpu_jobs=1
+deepvariant_num_shards=96
+```
+
+Auto mode with clean CPU fallback:
+
+```ini
+deepvariant_mode=auto
+deepvariant_docker_mode=true
+deepvariant_cpu_image=google/deepvariant:1.10.0-beta
+step3_cpu_jobs=1
+```
 
 
 ## Tools, Links, and Papers

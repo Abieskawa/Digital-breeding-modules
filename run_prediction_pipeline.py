@@ -84,6 +84,10 @@ def _parse_list_ordered(raw: str) -> List[str]:
 
 
 def _ensure_repo_root(repo_root: Optional[str]) -> None:
+    """
+    it helps child worker processes import this repo’s 
+    Python modules reliably.
+    """
     if not repo_root:
         return
     root = str(Path(repo_root))
@@ -118,13 +122,8 @@ def _set_thread_env(num_threads: int) -> None:
         pass
 
 
-def _prepare_fold_numeric_npz(
-    config: Dict[str, str],
-    *,
-    file_fold_index: str,
-    train_samples: List[str],
-    prediction_outdir: Path,
-) -> Path:
+def _prepare_fold_numeric_npz(config: Dict[str, str], *, file_fold_index: str,
+    train_samples: List[str],prediction_outdir: Path,) -> Path:
     snp_tool = SNP_numerical(config)
     tmp_dir = prediction_outdir / ".tmp" / "prediction_cv" / f"fold_{file_fold_index}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -177,6 +176,9 @@ def _build_model_jobs_for_fold(
 
     snp_tool = SNP_numerical(config)
     model_tool = ModelConstruction(config)
+    feature_mode = (config.get("prediction_feature_mode", "baseline_snp") or "baseline_snp").strip().lower()
+    if feature_mode not in {"baseline_snp", "prs_only", "snp_plus_prs"}:
+        raise ValueError(f"Unsupported prediction_feature_mode: {feature_mode}")
 
     pcs = parse_int_list(gwas_pcs) if gwas_pcs.strip() else snp_tool.gwas_n_pcs_list
     if not pcs:
@@ -191,11 +193,13 @@ def _build_model_jobs_for_fold(
         if not test_samples:
             raise ValueError(f"No test samples found in {fold_cfg['test_samples_file']}")
 
-        genotype_df = snp_tool.vcf_to_dataframe(snp_tool.vcf_file_path)
-        present = [s for s in test_samples if s in genotype_df.index]
-        if not present:
-            raise ValueError("No requested test samples were found in the VCF.")
-        test_df = genotype_df.loc[present]
+        test_df = None
+        if feature_mode != "prs_only":
+            genotype_df = snp_tool.vcf_to_dataframe(snp_tool.vcf_file_path)
+            present = [s for s in test_samples if s in genotype_df.index]
+            if not present:
+                raise ValueError("No requested test samples were found in the VCF.")
+            test_df = genotype_df.loc[present]
 
         for pc in pcs:
             file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
@@ -346,6 +350,7 @@ class PredictionPipeline(object):
         self.fastp_minlength = _coerce_int("fastp_length", configure.get("fastp_length", ""), 30)
         self.fastp_average_qual = _coerce_int("fastp_average_qual", configure.get("fastp_average_qual", "20"), 20)
         self.fastp_trim_front = configure.get("fastp_trim_front", "10")
+        self.fastp_dedup = coerce_bool(configure.get("fastp_dedup", ""), False)
         self.fastp_outdir = _resolve_outdir(
             base_outdir=self.outdir,
             subdir="00_Preprocessed_DNA",
@@ -383,7 +388,31 @@ class PredictionPipeline(object):
 
         # Optional VC knobs (leave unset if not present; VariantCalling has sane defaults)
         self.deepvariant_use_gpu = coerce_bool(configure.get("deepvariant_use_gpu", ""), False)
-        self.model_type = configure.get("model_type", "WGS")  # or WES
+        raw_deepvariant_mode = (configure.get("deepvariant_mode", "") or "").strip().lower()
+        self.deepvariant_mode = raw_deepvariant_mode or ("gpu" if self.deepvariant_use_gpu else "cpu")
+        if self.deepvariant_mode not in {"cpu", "gpu", "auto"}:
+            raise ValueError(f"Unsupported deepvariant_mode: {self.deepvariant_mode}")
+        self.deepvariant_docker_mode = coerce_bool(configure.get("deepvariant_docker_mode", ""), False)
+        self.deepvariant_gpu_image = (
+            configure.get("deepvariant_gpu_image", "google/deepvariant:1.10.0-gpu")
+            or "google/deepvariant:1.10.0-gpu"
+        ).strip()
+        self.deepvariant_cpu_image = (
+            configure.get("deepvariant_cpu_image", "google/deepvariant:1.10.0")
+            or "google/deepvariant:1.10.0"
+        ).strip()
+        self.gpu_devices = (configure.get("gpu_devices", "0") or "0").strip()
+        self.step3_max_concurrent_samples = max(
+            1,
+            _coerce_int("step3_max_concurrent_samples", configure.get("step3_max_concurrent_samples", ""), 1),
+        )
+        self.step3_gpu_jobs = max(1, _coerce_int("step3_gpu_jobs", configure.get("step3_gpu_jobs", ""), 1))
+        self.step3_cpu_jobs = max(1, _coerce_int("step3_cpu_jobs", configure.get("step3_cpu_jobs", ""), 1))
+        self.deepvariant_num_shards = max(
+            1,
+            _coerce_int("deepvariant_num_shards", configure.get("deepvariant_num_shards", ""), self.threads),
+        )
+        self.model_type = "WGS"
         self.capture_bed = configure.get("capture_bed", "") or None
         self.deepvariant_extra_args = (configure.get("deepvariant_extra_args", "") or "").strip()
         self.generate_bed = coerce_bool(configure.get("generate_bed", ""), False)
@@ -420,6 +449,11 @@ class PredictionPipeline(object):
         self.pred_pheno_csv = Path((configure.get("phenotype_csv_path") or "").strip()).expanduser().resolve() if (configure.get("phenotype_csv_path") or "").strip() else None
         self.pred_pheno_col = (configure.get("phenotype_column", "Phenotype") or "Phenotype").strip()
         self.pred_data_type = (configure.get("data_type", "binary") or "binary").strip().lower()
+        self.prediction_feature_mode = (
+            configure.get("prediction_feature_mode", "baseline_snp") or "baseline_snp"
+        ).strip().lower()
+        if self.prediction_feature_mode not in {"baseline_snp", "prs_only", "snp_plus_prs"}:
+            raise ValueError(f"Unsupported prediction_feature_mode: {self.prediction_feature_mode}")
 
         self.pred_num_splits = _coerce_int("num_splits", configure.get("num_splits", ""), 5)
         self.pred_random_state = _coerce_int("random_state", configure.get("random_state", ""), 2024)
@@ -431,7 +465,7 @@ class PredictionPipeline(object):
         self.pred_top_n_snps = (configure.get("top_n_snps_list", "10") or "10").strip()
         self.pred_models = (configure.get("models", "SVM,RandomForest,XGBoost") or "SVM,RandomForest,XGBoost").strip()
         self.pred_num_threads = _coerce_int("num_threads", configure.get("num_threads", ""), max(1, min(8, self.threads)))
-        self.pred_cv_workers = _coerce_int("cv_workers", configure.get("cv_workers", ""), max(1, min(self.pred_num_splits, self.pred_num_threads)))
+        self.pred_cv_workers = max(1, min(self.pred_num_splits, self.pred_num_threads))
 
         # Model-level parallelism is handled in the pipeline job queue; keep for compatibility.
         inner_model_raw = (configure.get("inner_model_workers", "") or "").strip()
@@ -737,11 +771,13 @@ class PredictionPipeline(object):
             pcs = parse_int_list(gwas_pcs_raw) if gwas_pcs_raw.strip() else [0]
 
             train_samples = CV_preparation.read_samples_file(Path(fold_cfg["train_samples_file"]))
+            test_samples = CV_preparation.read_samples_file(Path(fold_cfg["test_samples_file"]))
 
             prs_tool.run_fold(
                 file_fold_index,
                 pcs,
                 train_samples=train_samples,
+                test_samples=test_samples,
             )
         time_stamp("[step5] PRS scoring complete")
 
@@ -759,7 +795,7 @@ class PredictionPipeline(object):
                 lib_type="DNA",
                 trim_front=self.fastp_trim_front,
                 detect_adapter_pe=True,
-                dedup=True,
+                dedup=self.fastp_dedup,
                 report_dir=self.fastp_report_dir,
             )
             time_stamp("Finished preprocessing with fastp")

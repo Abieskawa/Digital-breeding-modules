@@ -15,8 +15,8 @@ Outputs:
     train_{...}_{phenotype_column}_GWAS_result.txt (BLINK output)
 """
 import os
+import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -78,18 +78,14 @@ class GWAS_PCA:
             resolve=True,
             ensure_dir=True,
         )
-        self.pca_scree_output_dir = _resolve_outdir(
+        pca_output_dir = _resolve_outdir(
             base_outdir=self.output_dir,
             subdir="evaluation/PCA_Scree_Plot",
             resolve=True,
             ensure_dir=True,
         )
-        self.pca_eval_output_dir = _resolve_outdir(
-            base_outdir=self.output_dir,
-            subdir="evaluation/PCA_Scree_Plot",
-            resolve=True,
-            ensure_dir=True,
-        )
+        self.pca_scree_output_dir = pca_output_dir
+        self.pca_eval_output_dir = pca_output_dir
         self.gwas_output_dir = _resolve_outdir(
             base_outdir=self.output_dir,
             subdir="GWAS_dir",
@@ -97,9 +93,43 @@ class GWAS_PCA:
             ensure_dir=True,
         )
 
-        self.blink_bin = self.config.get("blink_bin", "/home/abieskawa/tools/blink/blink1_5")
+        self.blink_bin = self._resolve_blink_bin(
+            self.config.get("blink_bin", "/home/abieskawa/tools/blink/blink1_5")
+        )
 
         self.load_chromosome_recode()
+
+    @staticmethod
+    def _ensure_executable(path: Path) -> Path:
+        if os.access(path, os.X_OK):
+            return path
+        try:
+            path.chmod(path.stat().st_mode | 0o111)
+        except OSError as exc:
+            raise PermissionError(
+                f"BLINK binary exists but is not executable: {path}. chmod +x failed: {exc}"
+            ) from exc
+        if not os.access(path, os.X_OK):
+            raise PermissionError(f"BLINK binary exists but is not executable: {path}")
+        return path
+
+    @classmethod
+    def _resolve_blink_bin(cls, raw_blink_bin: str) -> str:
+        blink_bin = (raw_blink_bin or "").strip()
+        if not blink_bin:
+            blink_bin = "/home/abieskawa/tools/blink/blink1_5"
+
+        path_candidate = Path(blink_bin).expanduser()
+        if path_candidate.exists():
+            return str(cls._ensure_executable(path_candidate))
+
+        resolved = shutil.which(blink_bin)
+        if resolved:
+            return resolved
+
+        raise FileNotFoundError(
+            f"BLINK binary not found: {blink_bin}. Set blink_bin=... in the config or install BLINK on PATH."
+        )
 
     def load_chromosome_recode(self):
         self.chromosome_mapping = pd.read_csv(self.chromosome_csv_path)
@@ -155,6 +185,23 @@ class GWAS_PCA:
             n_components = max(n_components, int(pca_components_override))
         return n_components
 
+    def _write_pca_outputs(
+        self,
+        tag: str,
+        principal_df: pd.DataFrame,
+        explained_variance_ratio: np.ndarray,
+    ) -> None:
+        try:
+            out_csv = os.path.join(self.pca_eval_output_dir, f"explained_variance_{tag}.csv")
+            pd.DataFrame({"explained_variance_ratio": explained_variance_ratio}).to_csv(
+                out_csv,
+                index=False,
+            )
+            comp_csv = os.path.join(self.pca_eval_output_dir, f"pca_components_{tag}.csv")
+            principal_df.to_csv(comp_csv, index=False)
+        except Exception:
+            pass
+
     def run_global_qc(self, *, pca_components_override: Optional[int] = None) -> None:
         from Prediction_model.snp_numeric_transformer import SNP_numerical
         from Evaluation.gwas_pca_eval import PCAEvaluator
@@ -178,17 +225,7 @@ class GWAS_PCA:
             genotype_numeric,
             n_components=n_components,
         )
-
-        try:
-            out_csv = os.path.join(self.pca_eval_output_dir, "explained_variance_global_qc.csv")
-            pd.DataFrame({"explained_variance_ratio": explained_variance_ratio}).to_csv(
-                out_csv,
-                index=False,
-            )
-            comp_csv = os.path.join(self.pca_eval_output_dir, "pca_components_global_qc.csv")
-            principal_df.to_csv(comp_csv, index=False)
-        except Exception:
-            pass
+        self._write_pca_outputs("global_qc", principal_df, explained_variance_ratio)
 
         pca_eval = PCAEvaluator(self.config)
         pca_eval.plot_global_qc(principal_df, explained_variance_ratio)
@@ -210,8 +247,7 @@ class GWAS_PCA:
         os.makedirs(os.path.join(self.gwas_output_dir, f"{file_fold_npc_index}"), exist_ok=True)
         current_dir = os.path.join(self.gwas_output_dir, f"{file_fold_npc_index}")
 
-        phenotype_df = pd.read_csv(self.phenotype_csv_path, sep=None, engine="python")
-        phenotype_df = phenotype_df[["taxa", self.phenotype_column]]
+        phenotype_df = self._load_phenotypes().reset_index()
         phenotype_df[self.phenotype_column], _ = encode_phenotype_series(
             phenotype_df[self.phenotype_column],
             log_prefix=f"GWAS phenotype ({file_fold_npc_index})",
@@ -236,6 +272,9 @@ class GWAS_PCA:
         regions_str = ",".join(map(str, original_chromosomes_to_keep))
 
         compressed_vcf = str(_ensure_bgzip_and_index(Path(vcf_file)))
+
+        if shutil.which("bcftools") is None:
+            raise FileNotFoundError("bcftools is required for step 4 but was not found on PATH.")
 
         command = (
             f'bcftools view -s "{train_samples_str}" -r "{regions_str}" "{compressed_vcf}" | '
@@ -263,15 +302,31 @@ class GWAS_PCA:
         )
 
         log_path = os.path.join(current_dir, f"blink_run_{tag}.log")
-        with open(log_path, "w") as log_file:
-            subprocess.run(
-                blink_command,
-                shell=True,
-                check=True,
-                cwd=current_dir,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-            )
+        try:
+            with open(log_path, "w") as log_file:
+                subprocess.run(
+                    blink_command,
+                    shell=True,
+                    check=True,
+                    cwd=current_dir,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+        except subprocess.CalledProcessError as exc:
+            log_tail = ""
+            try:
+                with open(log_path, "r") as log_file:
+                    lines = log_file.readlines()[-20:]
+                log_tail = "".join(lines).strip()
+            except OSError:
+                log_tail = ""
+            if log_tail:
+                raise RuntimeError(
+                    f"BLINK failed for {file_fold_npc_index}. See {log_path}. Log tail:\n{log_tail}"
+                ) from exc
+            raise RuntimeError(
+                f"BLINK failed for {file_fold_npc_index}. See {log_path}."
+            ) from exc
 
     def run_fold(
         self,
@@ -300,22 +355,7 @@ class GWAS_PCA:
             train_numeric,
             n_components=n_components,
         )
-        try:
-            out_csv = os.path.join(
-                self.pca_eval_output_dir,
-                f"explained_variance_{file_fold_index}.csv",
-            )
-            pd.DataFrame({"explained_variance_ratio": explained_variance_ratio}).to_csv(
-                out_csv,
-                index=False,
-            )
-            comp_csv = os.path.join(
-                self.pca_eval_output_dir,
-                f"pca_components_{file_fold_index}.csv",
-            )
-            principal_df.to_csv(comp_csv, index=False)
-        except Exception:
-            pass
+        self._write_pca_outputs(file_fold_index, principal_df, explained_variance_ratio)
 
         for pc in gwas_pcs_list:
             file_fold_npc_index = f"{file_fold_index}_{pc}PCs"

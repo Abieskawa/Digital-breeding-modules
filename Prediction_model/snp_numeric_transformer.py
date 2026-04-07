@@ -17,7 +17,7 @@ It supports TWO modes that match your intended pipeline flow:
 Unrelated parts (PCA, GWAS running, model training, CV loops) are NOT implemented here.
 """
 import os
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -51,13 +51,42 @@ class SNP_numerical:
             subdir="Model_result",
             ensure_dir=True,
         )
+        self.prs_output_dir = _resolve_outdir(
+            base_outdir=self.output_dir,
+            subdir="PRS_dir",
+            ensure_dir=True,
+        )
 
         self.top_n_snps_list = parse_int_list(self.config.get('top_n_snps_list', '10'))
+        self.prediction_feature_mode = (
+            self.config.get('prediction_feature_mode', 'baseline_snp') or 'baseline_snp'
+        ).strip().lower()
+        if self.prediction_feature_mode not in {'baseline_snp', 'prs_only', 'snp_plus_prs'}:
+            raise ValueError(f"Unsupported prediction_feature_mode: {self.prediction_feature_mode}")
 
         # GWAS PC list (can be independent from PCA extraction count)
         self.gwas_n_pcs_list = parse_int_list(self.config.get('gwas_n_pcs_list', '')) or \
                               parse_int_list(self.config.get('gwas_n_pcs', '')) or \
                               parse_int_list(self.config.get('n_pcs_list', '0'))
+
+    def _load_prs_features(self, file_fold_npc_index: str, split: str) -> pd.DataFrame:
+        prs_path = os.path.join(self.prs_output_dir, file_fold_npc_index, f"prs_scores_{file_fold_npc_index}.csv")
+        if not os.path.exists(prs_path):
+            raise FileNotFoundError(
+                f"PRS features missing for {file_fold_npc_index}: {prs_path} (run step 5 or use prediction_feature_mode=baseline_snp)"
+            )
+
+        prs_df = pd.read_csv(prs_path)
+        if "taxa" not in prs_df.columns or "split" not in prs_df.columns:
+            raise ValueError(f"PRS score file must contain taxa and split columns: {prs_path}")
+
+        split_df = prs_df[prs_df["split"] == split].copy()
+        if split_df.empty:
+            raise ValueError(f"No PRS rows found for split='{split}' in {prs_path}")
+
+        split_df = split_df.drop(columns=["split", self.phenotype_column], errors="ignore")
+        split_df = split_df.set_index("taxa")
+        return split_df
 
     def get_vcf_header(self, vcf_file: str) -> List[str]:
         with _open_text_maybe_gz(vcf_file) as f:
@@ -148,14 +177,12 @@ class SNP_numerical:
         self,
         file_fold_npc_index: str,
         file_fold_npc_nsnp_index: str,
-        test_df: pd.DataFrame,
+        test_df: Optional[pd.DataFrame],
         top_n_snps: int = 10
     ) -> List[str]:
         current_dir = os.path.join(self.gwas_output_dir, file_fold_npc_index)
         p_value_file = os.path.join(current_dir, f'train_{file_fold_npc_index}_{self.phenotype_column}_GWAS_result.txt')
         vcf_file = os.path.join(current_dir, f'train_{file_fold_npc_index}.vcf')
-
-        top_snps = self.select_top_snps(p_value_file, top_n_snps)
 
         phenotype_df = pd.read_csv(self.phenotype_csv_path, sep=None, engine='python')
         phenotype_df = phenotype_df[['taxa', self.phenotype_column]]
@@ -165,12 +192,34 @@ class SNP_numerical:
         )
         phenotype_df.set_index('taxa', inplace=True)
 
-        train_genotype_df = self.vcf_to_dataframe(vcf_file)
-        train_selected_snps = train_genotype_df[top_snps]
-        train_selected_snps = self.convert_genotypes_to_numeric(train_selected_snps)
+        top_snps: List[str] = []
+        train_selected_snps: pd.DataFrame
+        test_selected_snps: pd.DataFrame
 
-        test_selected_snps = test_df[top_snps]
-        test_selected_snps = self.convert_genotypes_to_numeric(test_selected_snps)
+        if self.prediction_feature_mode != 'prs_only':
+            if test_df is None:
+                raise ValueError("test_df is required for SNP-based prediction feature modes.")
+            top_snps = self.select_top_snps(p_value_file, top_n_snps)
+
+            train_genotype_df = self.vcf_to_dataframe(vcf_file)
+            train_selected_snps = train_genotype_df[top_snps]
+            train_selected_snps = self.convert_genotypes_to_numeric(train_selected_snps)
+
+            test_selected_snps = test_df[top_snps]
+            test_selected_snps = self.convert_genotypes_to_numeric(test_selected_snps)
+        else:
+            train_selected_snps = pd.DataFrame(index=phenotype_df.index)
+            test_selected_snps = pd.DataFrame(index=phenotype_df.index)
+
+        if self.prediction_feature_mode in {'prs_only', 'snp_plus_prs'}:
+            train_prs = self._load_prs_features(file_fold_npc_index, 'train')
+            test_prs = self._load_prs_features(file_fold_npc_index, 'test')
+            if self.prediction_feature_mode == 'prs_only':
+                train_selected_snps = train_prs
+                test_selected_snps = test_prs
+            else:
+                train_selected_snps = train_selected_snps.join(train_prs, how='inner')
+                test_selected_snps = test_selected_snps.join(test_prs, how='inner')
 
         train_selected_snps = train_selected_snps.join(phenotype_df, how='inner')
         train_selected_snps.rename(columns={self.phenotype_column: 'Phenotype'}, inplace=True)

@@ -11,6 +11,10 @@ Outputs (you may request any combination):
   --map-only           perform mapping and filtering only; skip StringTie and prepDE
   --merge-expression   merge and process per-mode tables into a single expression table (FPKM/TPM/counts)
 Each output mode writes into its own directory under --out-dir; per-sample count matrices are placed at --out-dir.
+
+RNA-seq note:
+  fastp duplicate removal must not be used for RNA libraries. If reads were preprocessed
+  with Preprocess/fastp_preprocessing.py, run it with --lib-type RNA and do not pass --dedup.
 """
 import argparse, subprocess, glob, os, sys, math, re
 
@@ -61,6 +65,7 @@ def main():
     args = ap.parse_args()
 
     print('Command invoked:', ' '.join(sys.argv), flush=True)
+    print('RNA-seq note: fastp duplicate removal (--dedup) must not be used for RNA libraries.', flush=True)
 
     if args.annotation.lower().endswith(('.gff', '.gff3')):
         sys.exit('Error: GFF input is not suggested to run STAR; please provide a GTF (*.gtf) file.')

@@ -109,6 +109,37 @@ class PRSCalculator:
 
         self.snp_tool = SNP_numerical(self.config)
 
+    def _genotypes_to_numeric_no_impute(self, genotype_df: pd.DataFrame) -> pd.DataFrame:
+        genotype_numeric_df = genotype_df.apply(
+            lambda col: col.map(lambda x: self.snp_tool._map_gt(self.snp_tool._to_gt(x)))
+        )
+        return genotype_numeric_df.astype(float)
+
+    def _prepare_train_test_numeric(
+        self,
+        train_geno_raw: pd.DataFrame,
+        test_geno_raw: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        train_num = self._genotypes_to_numeric_no_impute(train_geno_raw)
+        test_num = self._genotypes_to_numeric_no_impute(test_geno_raw) if not test_geno_raw.empty else pd.DataFrame(index=test_geno_raw.index)
+
+        all_missing = train_num.isna().all(axis=0)
+        if all_missing.any():
+            train_num = train_num.loc[:, ~all_missing]
+            test_num = test_num.reindex(columns=train_num.columns)
+
+        if train_num.shape[1] == 0:
+            raise ValueError("All selected PRS variants are missing in the train fold.")
+
+        medians = train_num.median(axis=0, skipna=True)
+        valid_cols = medians[medians.notna()].index.tolist()
+        if not valid_cols:
+            raise ValueError("Unable to derive PRS train-fold medians for imputation.")
+
+        train_num = train_num[valid_cols].fillna(medians.loc[valid_cols])
+        test_num = test_num.reindex(columns=valid_cols).fillna(medians.loc[valid_cols])
+        return train_num, test_num
+
     def _load_phenotypes(self) -> pd.DataFrame:
         if not self.phenotype_csv_path:
             raise ValueError("phenotype_csv_path is required for PRS.")
@@ -253,23 +284,23 @@ class PRSCalculator:
         gwas_pcs_list: Sequence[int],
         *,
         train_samples: Sequence[str],
+        test_samples: Sequence[str],
     ) -> None:
         gwas_pcs = [int(pc) for pc in gwas_pcs_list] if gwas_pcs_list else [0]
         pheno_df = None
         if self.include_phenotype or self.weight_mode == "corr_logp":
             pheno_df = self._load_phenotypes()
+        if not self.vcf_file_path:
+            raise ValueError("vcf_file_path is required for PRS scoring.")
+        cohort_geno_raw = self.snp_tool.vcf_to_dataframe(self.vcf_file_path)
 
         for pc in gwas_pcs:
             file_fold_npc_index = f"{file_fold_index}_{pc}PCs"
             gwas_dir = Path(self.gwas_output_dir) / file_fold_npc_index
             gwas_file = gwas_dir / f"train_{file_fold_npc_index}_{self.phenotype_column}_GWAS_result.txt"
-            train_vcf = gwas_dir / f"train_{file_fold_npc_index}.vcf"
 
             if not gwas_file.exists():
                 time_stamp(f"[PRS] GWAS results missing: {gwas_file}")
-                continue
-            if not train_vcf.exists():
-                time_stamp(f"[PRS] Train VCF missing: {train_vcf}")
                 continue
 
             gwas_df = self._load_gwas_results(gwas_file)
@@ -290,16 +321,21 @@ class PRSCalculator:
                 time_stamp(f"[PRS] No SNPs selected for {file_fold_npc_index}")
                 continue
 
-            train_geno_raw = self.snp_tool.vcf_to_dataframe(str(train_vcf))
-            train_geno_raw, train_present = self._filter_samples(train_geno_raw, train_samples)
+            train_geno_raw, train_present = self._filter_samples(cohort_geno_raw, train_samples)
             if not train_present or train_geno_raw.empty:
                 time_stamp(f"[PRS] No train samples available for {file_fold_npc_index}")
                 continue
+            test_geno_raw, test_present = self._filter_samples(cohort_geno_raw, test_samples)
+            if not test_present or test_geno_raw.empty:
+                time_stamp(f"[PRS] No test samples available for {file_fold_npc_index}")
+                continue
+
             train_geno_raw, available_snps = self._filter_snps(train_geno_raw, union_snps)
             if not available_snps:
-                time_stamp(f"[PRS] No selected SNPs found in train VCF for {file_fold_npc_index}")
+                time_stamp(f"[PRS] No selected SNPs found in cohort VCF for {file_fold_npc_index}")
                 continue
-            train_geno = self.snp_tool.convert_genotypes_to_numeric(train_geno_raw)
+            test_geno_raw, _ = self._filter_snps(test_geno_raw, available_snps)
+            train_geno, test_geno = self._prepare_train_test_numeric(train_geno_raw, test_geno_raw)
 
             corr_sign = None
             if self.weight_mode == "corr_logp" and pheno_df is not None:
@@ -307,6 +343,7 @@ class PRSCalculator:
                 corr_sign = self._corr_sign(train_geno, pheno_series)
 
             train_scores: Dict[str, pd.Series] = {}
+            test_scores: Dict[str, pd.Series] = {}
             for label, top_df in top_dfs.items():
                 top_snps = [s for s in top_df["snp_id"].tolist() if s in available_snps]
                 if not top_snps:
@@ -315,6 +352,10 @@ class PRSCalculator:
                 weights = self._build_weights(gwas_df, filtered_top_df, corr_sign)
                 weights = weights.reindex(top_snps)
                 train_scores[label] = self._score(train_geno, weights)
+                test_scores[label] = self._score(test_geno, weights)
+            if not train_scores:
+                time_stamp(f"[PRS] No usable PRS score columns for {file_fold_npc_index}")
+                continue
 
             out_dir = Path(self.prs_output_dir) / file_fold_npc_index
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -324,7 +365,8 @@ class PRSCalculator:
                 pheno_series = pheno_df[self.phenotype_column]
 
             train_df = self._assemble_scores("train", train_present, train_scores, pheno_series)
-            out_scores = train_df
+            test_df = self._assemble_scores("test", test_present, test_scores, pheno_series)
+            out_scores = pd.concat([train_df, test_df], ignore_index=True)
             out_path = out_dir / f"prs_scores_{file_fold_npc_index}.csv"
             out_scores.to_csv(out_path, index=False)
             time_stamp(f"[PRS] Wrote {out_path}")
@@ -375,11 +417,13 @@ def run_prs_from_config(
         pcs = parse_int_list(gwas_pcs_raw) if gwas_pcs_raw.strip() else [0]
 
         train_samples = CV_preparation.read_samples_file(Path(fold_cfg["train_samples_file"]))
+        test_samples = CV_preparation.read_samples_file(Path(fold_cfg["test_samples_file"]))
 
         prs_tool.run_fold(
             file_fold_index,
             pcs,
             train_samples=train_samples,
+            test_samples=test_samples,
         )
 
 

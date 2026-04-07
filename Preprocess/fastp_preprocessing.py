@@ -28,6 +28,7 @@ import argparse
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # Allow running this script from outside the repo.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -41,6 +42,16 @@ R1_PATTERNS = [
     "*_R1_*.fastq", "*_R1_*.fq", "*_R1_*.fastq.gz", "*_R1_*.fq.gz",
 ]
 FASTP_MAX_THREADS = 64
+
+
+def _distribute_fastp_threads(total_threads: int, n_jobs: int) -> List[int]:
+    total_threads = max(1, int(total_threads))
+    n_jobs = max(1, int(n_jobs))
+    n_jobs = min(n_jobs, total_threads)
+    base = total_threads // n_jobs
+    extra = total_threads % n_jobs
+    alloc = [base + (1 if idx < extra else 0) for idx in range(n_jobs)]
+    return [max(1, min(FASTP_MAX_THREADS, val)) for val in alloc]
 
 def load_trim_file(trim_file: str) -> Tuple[Dict[str, int], Dict[str, int]]:
     """
@@ -139,13 +150,16 @@ def run_fastp(
     if threads < 1:
         print(f"[warn] fastp threads must be >= 1; using 1 (requested {threads})", file=sys.stderr)
         threads = 1
-    elif threads > FASTP_MAX_THREADS:
-        raise ValueError(
-            f"--threads exceeds max supported ({FASTP_MAX_THREADS}); got {threads}"
-        )
 
     if lib_type == "RNA" and dedup:
         raise ValueError("--dedup is not allowed for RNA libraries. Remove --dedup or use --lib-type DNA.")
+    if dedup:
+        print(
+            "[warn] fastp dedup is enabled. This mode is much heavier on large DNA FASTQs and can stall on some datasets; "
+            "leave fastp_dedup=false unless you explicitly need fastp duplicate removal.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # parse front trimming
     per_r1: Dict[str, int] = {}
@@ -166,7 +180,16 @@ def run_fastp(
         print(f"[info] No paired FASTQs found in {wd}", file=sys.stderr)
         return
 
-    for base, style, r1, r2 in pairs:
+    max_parallel_jobs = max(1, min(len(pairs), (threads + FASTP_MAX_THREADS - 1) // FASTP_MAX_THREADS))
+    thread_plan = _distribute_fastp_threads(threads, max_parallel_jobs)
+    print(
+        f"[info] fastp scheduling: total_threads={threads}, processes={max_parallel_jobs}, "
+        f"per_process_threads={thread_plan}",
+        flush=True,
+    )
+
+    jobs = []
+    for pair_idx, (base, style, r1, r2) in enumerate(pairs):
         # preserve original style in output names
         rtag1, rtag2 = ("R1", "R2") if style == "R" else ("1", "2")
 
@@ -186,9 +209,10 @@ def run_fastp(
         html = repdir / f"{base}.fastp.html"
         jsn  = repdir / f"{base}.fastp.json"
 
+        assigned_threads = thread_plan[pair_idx % len(thread_plan)]
         cmd = [
             "fastp",
-            "-w", str(threads),
+            "-w", str(assigned_threads),
             "-i", str(wd / r1),
             "-I", str(wd / r2),
             "-o", str(out1),
@@ -219,16 +243,33 @@ def run_fastp(
         if isinstance(trim_r2, int):
             cmd += ["-F", str(trim_r2)]
 
+        jobs.append((base, cmd))
+
+    def _run_one(job: Tuple[str, List[str]]) -> str:
+        base, cmd = job
         print("[info] Running:", " ".join(cmd), flush=True)
         try:
             subprocess.run(cmd, check=True)
         except subprocess.CalledProcessError as e:
             print(f"[error] fastp failed for {base}: {e}", file=sys.stderr)
             raise
+        return base
+
+    if max_parallel_jobs == 1:
+        for job in jobs:
+            _run_one(job)
+        return
+
+    with ThreadPoolExecutor(max_workers=max_parallel_jobs) as ex:
+        futures = [ex.submit(_run_one, job) for job in jobs]
+        for fut in as_completed(futures):
+            fut.result()
 
 def main():
     ap = build_argparser()
     a = ap.parse_args()
+    if a.lib_type == "RNA" and a.dedup:
+        ap.error("--dedup cannot be used with --lib-type RNA.")
 
     run_fastp(
         wd=Path(a.wd).resolve(),

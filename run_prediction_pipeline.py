@@ -28,6 +28,17 @@ from PRS.run_prs import PRSCalculator
 from Prediction_model.model_construction import ModelConstruction
 from Prediction_model.snp_numeric_transformer import SNP_numerical
 
+DEFAULT_PARAM_TRACK_DIR = Path("/home/abieskawa/analysis/Digital-breeding-modules/test")
+DEFAULT_PARAM_TRACK_CONFIG = Path("/home/abieskawa/analysis/2020_Tilapia_skimSeq_Disease_Resistance/configure.txt")
+
+
+def _default_param_reference_text() -> str:
+    return (
+        "Reference defaults: test assets under "
+        f"{DEFAULT_PARAM_TRACK_DIR} and config defaults in {DEFAULT_PARAM_TRACK_CONFIG}."
+    )
+
+
 def _coerce_int(name: str, raw: str, default: int) -> int:
     """
     Convert raw to int, quietly falling back to default when the field is blank/missing.
@@ -43,6 +54,27 @@ def _coerce_int(name: str, raw: str, default: int) -> int:
     except (TypeError, ValueError):
         print(f"Warning: Invalid integer for {name}, using default {default}.")
         return default
+
+
+def _default_sort_mem(threads: int) -> str:
+    """
+    Estimate a safe per-thread memory limit for samtools sort -m from total RAM.
+    Keep a safety margin for the OS/other tools and cap the per-thread default
+    so large-memory servers do not request an unnecessarily huge sort buffer.
+    """
+    fallback = "8G"
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        phys_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        total_bytes = page_size * phys_pages
+        if total_bytes <= 0:
+            return fallback
+        usable_bytes = int(total_bytes * 0.75)
+        per_thread_gib = usable_bytes // max(1, int(threads)) // (1024 ** 3)
+        per_thread_gib = max(1, min(32, int(per_thread_gib)))
+        return f"{per_thread_gib}G"
+    except (AttributeError, OSError, TypeError, ValueError):
+        return fallback
 
 
 def _parse_steps(raw: str) -> Set[str]:
@@ -182,10 +214,18 @@ def _build_model_jobs_for_fold(
 
     pcs = parse_int_list(gwas_pcs) if gwas_pcs.strip() else snp_tool.gwas_n_pcs_list
     if not pcs:
-        pcs = [0]
+        raise ValueError(
+            f"No GWAS PC settings were provided for fold {file_fold_index}. "
+            "Set gwas_pcs in the fold config or gwas_n_pcs_list/gwas_n_pcs/n_pcs_list in the main config. "
+            f"{_default_param_reference_text()}"
+        )
     nsnps = parse_int_list(top_n_snps) if top_n_snps.strip() else snp_tool.top_n_snps_list
     if not nsnps:
-        nsnps = [10]
+        raise ValueError(
+            f"No top_n_snps settings were provided for fold {file_fold_index}. "
+            "Set top_n_snps in the fold config or top_n_snps_list in the main config. "
+            f"{_default_param_reference_text()}"
+        )
     models_list = [m.strip() for m in models.split(",") if m.strip()] if models.strip() else model_tool.models
 
     if prepare:
@@ -277,7 +317,7 @@ def _pca_plot_worker(job: Dict[str, object]) -> str:
 
 def _roc_shap_worker(job: Dict[str, object]) -> str:
     config = job["config"]
-    artifact = str(job["artifact"])
+    artifact = str(job["artifact"]) #ex. RandomForest_2PCs_50SNPs_fold3.pkl
     evaluator = RocShapEvaluator(config)
     _generate_shap_output_for_artifact(
         model_output_dir=str(evaluator.model_output_dir),
@@ -341,8 +381,12 @@ class PredictionPipeline(object):
         self.chromosome_csv_path = Path(chrom_raw).expanduser().resolve() if chrom_raw else None
 
         # Resources
-        self.threads = _coerce_int("threads", configure.get("threads", ""), 96)
-        self.mem = configure.get("mem", "8G")
+        cpu_raw = configure.get("cpus", "")
+        if str(cpu_raw or "").strip() == "":
+            cpu_raw = configure.get("threads", "")
+        self.threads = _coerce_int("cpus", cpu_raw, 96)
+        self.cpus = self.threads
+        self.mem = (configure.get("mem") or "").strip() or _default_sort_mem(self.threads)
 
         # fastp
         self.fastp_threads = _coerce_int("fastp_threads", configure.get("fastp_threads", ""), self.threads)
@@ -407,7 +451,6 @@ class PredictionPipeline(object):
             _coerce_int("step3_max_concurrent_samples", configure.get("step3_max_concurrent_samples", ""), 1),
         )
         self.step3_gpu_jobs = max(1, _coerce_int("step3_gpu_jobs", configure.get("step3_gpu_jobs", ""), 1))
-        self.step3_cpu_jobs = max(1, _coerce_int("step3_cpu_jobs", configure.get("step3_cpu_jobs", ""), 1))
         self.deepvariant_num_shards = max(
             1,
             _coerce_int("deepvariant_num_shards", configure.get("deepvariant_num_shards", ""), self.threads),
@@ -459,13 +502,12 @@ class PredictionPipeline(object):
         self.pred_random_state = _coerce_int("random_state", configure.get("random_state", ""), 2024)
         self.pred_cv_folds_file = self.prediction_outdir / "cv_folds.tsv"
         # PCs used as GWAS covariates (separate from PCA extraction count)
-        self.pred_gwas_pcs = (configure.get("gwas_n_pcs_list") or configure.get("gwas_n_pcs") or configure.get("n_pcs_list") or "0").strip()
+        self.pred_gwas_pcs = (configure.get("gwas_n_pcs_list") or configure.get("gwas_n_pcs") or configure.get("n_pcs_list") or "").strip()
         self.pred_pca_n_components = (configure.get("pca_n_components", "") or "").strip()
 
-        self.pred_top_n_snps = (configure.get("top_n_snps_list", "10") or "10").strip()
+        self.pred_top_n_snps = (configure.get("top_n_snps_list") or "").strip()
         self.pred_models = (configure.get("models", "SVM,RandomForest,XGBoost") or "SVM,RandomForest,XGBoost").strip()
-        self.pred_num_threads = _coerce_int("num_threads", configure.get("num_threads", ""), max(1, min(8, self.threads)))
-        self.pred_cv_workers = max(1, min(self.pred_num_splits, self.pred_num_threads))
+        self.pred_cv_workers = max(1, min(self.pred_num_splits, int(self.threads)))
 
         # Model-level parallelism is handled in the pipeline job queue; keep for compatibility.
         inner_model_raw = (configure.get("inner_model_workers", "") or "").strip()
@@ -697,7 +739,7 @@ class PredictionPipeline(object):
             if self.pred_inner_model_workers:
                 model_threads = int(self.pred_inner_model_workers)
             else:
-                model_threads = max(1, int(self.pred_num_threads) // max_workers)
+                model_threads = max(1, int(self.threads) // max_workers)
             for job in jobs:
                 job["model_threads"] = model_threads
             with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -732,7 +774,7 @@ class PredictionPipeline(object):
         if self.pred_inner_model_workers:
             model_threads = int(self.pred_inner_model_workers)
         else:
-            model_threads = max(1, int(self.pred_num_threads) // max_workers)
+            model_threads = max(1, int(self.threads) // max_workers)
         for job in jobs:
             job["model_threads"] = model_threads
         with ProcessPoolExecutor(max_workers=max_workers) as ex:
@@ -749,10 +791,8 @@ class PredictionPipeline(object):
                 dfs = [pd.read_csv(p) for p in result_files]
                 combined = pd.concat(dfs, ignore_index=True)
                 combined = combined.sort_values(by=["n_pcs", "n_snps", "model_name"])
-                mean_df = combined.groupby(["n_pcs", "n_snps", "model_name"])[["accuracy", "specificity", "mcc", "f1_score"]].mean().reset_index()
                 combined.to_csv(self.prediction_outdir / "model_evaluation_results_all.csv", index=False)
-                mean_df.to_csv(self.prediction_outdir / "model_evaluation_results_mean.csv", index=False)
-                time_stamp("[step6] Wrote model_evaluation_results_all.csv and model_evaluation_results_mean.csv")
+                time_stamp("[step6] Wrote model_evaluation_results_all.csv")
 
     def _run_prediction_prs_step5(self) -> None:
         """

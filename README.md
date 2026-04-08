@@ -39,6 +39,10 @@ If you use conda instead of micromamba, replace `micromamba` with `conda`.
 Run the pipeline via:
 `python run_prediction_pipeline.py --config_file path/to/configure.txt`
 
+Parameter reference files:
+- Repo-shipped example assets and example config values: `/home/abieskawa/analysis/Digital-breeding-modules/test`
+- Working reference config used for tracked defaults: `/home/abieskawa/analysis/2020_Tilapia_skimSeq_Disease_Resistance/configure.txt`
+
 Core steps (`step=1-6` in config):
 
     raw FASTQ + ref FASTA (+ optional GFF)

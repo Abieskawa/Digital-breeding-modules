@@ -57,7 +57,7 @@ class GWAS_PCA:
         self.gwas_n_pcs_list = (
             parse_int_list(self.config.get("gwas_n_pcs_list", ""))
             or parse_int_list(self.config.get("gwas_n_pcs", ""))
-            or parse_int_list(self.config.get("n_pcs_list", "0"))
+            or parse_int_list(self.config.get("n_pcs_list", ""))
         )
 
         raw_pca_n = self.config.get("pca_n_components", "").strip()

@@ -42,6 +42,8 @@ R1_PATTERNS = [
     "*_R1_*.fastq", "*_R1_*.fq", "*_R1_*.fastq.gz", "*_R1_*.fq.gz",
 ]
 FASTP_MAX_THREADS = 64
+FASTP_PREFERRED_THREADS = 16
+FASTP_MIN_PARALLEL_THREADS = 8
 
 
 def _distribute_fastp_threads(total_threads: int, n_jobs: int) -> List[int]:
@@ -52,6 +54,17 @@ def _distribute_fastp_threads(total_threads: int, n_jobs: int) -> List[int]:
     extra = total_threads % n_jobs
     alloc = [base + (1 if idx < extra else 0) for idx in range(n_jobs)]
     return [max(1, min(FASTP_MAX_THREADS, val)) for val in alloc]
+
+
+def _choose_fastp_job_count(total_threads: int, n_pairs: int) -> int:
+    total_threads = max(1, int(total_threads))
+    n_pairs = max(1, int(n_pairs))
+
+    # Prefer more sample-level concurrency and keep per-process thread counts
+    # in a range where fastp tends to scale better on large servers.
+    preferred_jobs = max(1, (total_threads + FASTP_PREFERRED_THREADS - 1) // FASTP_PREFERRED_THREADS)
+    max_jobs_by_floor = max(1, total_threads // FASTP_MIN_PARALLEL_THREADS)
+    return max(1, min(n_pairs, preferred_jobs, max_jobs_by_floor))
 
 def load_trim_file(trim_file: str) -> Tuple[Dict[str, int], Dict[str, int]]:
     """
@@ -180,11 +193,11 @@ def run_fastp(
         print(f"[info] No paired FASTQs found in {wd}", file=sys.stderr)
         return
 
-    max_parallel_jobs = max(1, min(len(pairs), (threads + FASTP_MAX_THREADS - 1) // FASTP_MAX_THREADS))
+    max_parallel_jobs = _choose_fastp_job_count(threads, len(pairs))
     thread_plan = _distribute_fastp_threads(threads, max_parallel_jobs)
     print(
         f"[info] fastp scheduling: total_threads={threads}, processes={max_parallel_jobs}, "
-        f"per_process_threads={thread_plan}",
+        f"per_process_threads={thread_plan}, target_threads_per_process={FASTP_PREFERRED_THREADS}",
         flush=True,
     )
 

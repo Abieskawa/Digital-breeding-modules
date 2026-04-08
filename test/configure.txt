@@ -1,29 +1,32 @@
 # General
-# step1: Preprocessing DNA-seq, step2: DNA-seq alignment, step3: run deep variant,
-# step4: BLINK GWAS/PCA, step5: PRS scoring, step6: SNP prediction model
+# step1: Preprocessing DNA-seq, step2: DNA-seq alignment, step3: run deep variant, step4: BLINK GWAS/PCA, step5: SNP prediction model
 # step0: do nothing in pipeline; allow users to adjust evaluation step
-step=1-3
-eva_step=0-3
-output_dir=DGBreeding
+step=0-4
+eva_step=0-4
+output_dir=DGBreeding_test
 input_dir=DNA_seq
 ref_fasta=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.fna
 gff=ref/GCF_001858045.2_O_niloticus_UMD_NMBU_genomic.gff
 population=Streptococcus_resistance_population # For Readgroup/Circos naming (e.g., F2, diversity_panel)
 
 # Resources
-threads=96
-mem=8G
+cpus=160
+mem=32G
+deepvariant_mode=gpu
+deepvariant_docker_mode=true
+deepvariant_gpu_image=google/deepvariant:1.10.0-gpu
+deepvariant_cpu_image=google/deepvariant:1.10.0
+gpu_devices=0  # GPU device IDs to expose to DeepVariant, e.g. 0 or 0,1
 
 # Step 1: Preprocessing DNA-seq (fastp)
 fastp_quality=20
 fastp_length=30
 fastp_average_qual=20
 fastp_trim_front=10
-fastp_threads=64  # Optional total fastp CPU budget; >64 will be split across multiple fastp processes, max 64 threads each
-fastp_dedup=false # Optional: enable fastp duplicate removal. Keep false unless you explicitly need it.
+fastp_threads=160  # Total fastp CPU budget; >64 will be split across multiple fastp processes
 
 # Step 2: DNA-seq alignment
-seq_platform=Hiseq # Optical distance for Novaseq: 2500; HiSeq=100
+seq_platform=HiSeq # Optical distance for Novaseq: 2500; HiSeq=100
 optical_distance=100 # Override optical distance used by samtools markdup (defaults to HiSeq=100 when platform unknown)
 mark_duplicates=true # Set false to skip samtools markdup (pipeline will only sort and filter)
 filter_proper_pairs=false # If true, apply samtools view -f 2 -F 2048; set false to keep all alignments
@@ -32,16 +35,9 @@ skip_alignment_samples=  # optional: comma/semicolon-separated sample IDs to ski
 skip_variant_samples=    # optional: skip these samples in variant calling (defaults to alignment list if left blank)
 
 # Step 3: Variant calling
-# deepvariant_use_gpu=false   # Optional: pass --use_gpu to DeepVariant if GPU build/drivers are available
-# deepvariant_mode=cpu        # cpu|gpu|auto; default keeps current CPU behavior unless deepvariant_use_gpu=true
-# deepvariant_docker_mode=false
-# deepvariant_gpu_image=google/deepvariant:1.10.0-gpu
-# deepvariant_cpu_image=google/deepvariant:1.10.0-beta
-# gpu_devices=0
-# step3_max_concurrent_samples=1
-# step3_gpu_jobs=1            # only applies to DeepVariant GPU jobs
-# step3_cpu_jobs=1            # only applies to DeepVariant CPU jobs
-# deepvariant_num_shards=96
+step3_max_concurrent_samples=1  # Maximum number of samples processed in parallel during variant calling
+step3_gpu_jobs=1  # Number of concurrent DeepVariant GPU jobs; usually keep at 1 per GPU
+deepvariant_num_shards=64  # CPU threads used inside one DeepVariant sample job; CPU-mode sample concurrency is auto-derived from cpus/shards
 # capture_bed=        # Optional: path to a pre-built capture BED (leave blank when auto-generating)
 # Optional: auto-generate capture BED for GLnexus
 generate_bed=true
@@ -54,12 +50,14 @@ bed_require_genes=true   # set true for gene-only (requires gff=...)
 # bed_gene_biotype=        # optional; leave blank to keep any gene biotype
 # bed_output=              # optional; default: 02_Variant_Calling/glnexus.capture.bed
 
-# PLINK2 quality filtration (always applied)
+# PLINK quality filtration
 hwe_p=1e-5
 geno_missing=0.10
 
+# LD pruning is currently always kept on by the pipeline.
+ld_prune=true
 # ld_method=indep-pairwise or indep
-# LD-pruning parameters (always applied)
+# LD-pruning parameters
 ld_method=indep
 ld_window=50
 ld_step=5
@@ -70,10 +68,13 @@ gff_biotype=protein_coding
 circos_window=10000 # bp; bin size for both gene and variant tracks
 # Optional: control circos tick spacing
 circos_tick_step=10000000    # bp; set e.g., 10000000 for 10 Mb fixed tick spacing; if blank -> only 0 and end
+# Number of longest chromosomes/contigs to plot in circos (e.g., 21 = top 21 by length)
+target_seq=21
+# Alternatively, restrict circos to specific chromosomes/contigs (comma-separated). Leave blank to plot all.
+# circos_chroms=chr1,chr2,chr3
 
 # Model construction:
 num_splits=10  # x-fold cross-validation
-random_state=2024  # CV split seed
 
 # Step 4: BLINK GWAS / PCA
 # BLINK (GWAS)
@@ -82,40 +83,26 @@ chromosome_csv_path=test/chromosome_mapping_example.csv  # Example chromosome re
 
 # PCA settings
 use_pcs=True  # Set to False if you don't want to use PCs
-n_pcs_list=0,1,2,3  # List of PCs to test, separated by commas #max:15
+n_pcs_list=0,1  # List of PCs to test, separated by commas #max:15
 
-# Step 5 / 6: PRS + SNP prediction model
+# Step 5: SNP prediction model
 phenotype_csv_path=test/phenotype_example.csv  # Example phenotype CSV shipped with the repo
 
 # Phenotype column in your phenotype CSV
 species_name=Oreochromis_niloticus # Name of target species for name/title tag
 phenotype_column=Group  # Or any other phenotype column you are using #Chlorosis_10
 data_type=binary # binary, multiclass, regression
-prediction_feature_mode=baseline_snp # baseline_snp | prs_only | snp_plus_prs
+prediction_feature_mode=baseline_snp
 
 
 # Top N SNPs settings
 top_n_snps_list=10,50  # List of top N SNPs to test, separated by commas
 
-# Step 5: Optional PRS scoring (train-derived weights applied to both train and test within each fold)
-prs_top_n_snps_list=1-10,11-20,21-50  # PRS rank bins (range format only)
+# Optional PRS experiment settings
+prs_top_n_snps_list=1-10,11-20,21-50
 
 # Models to evaluate
 models=MLP,SVM,RandomForest,XGBoost  # List of models to test, separated by commas #Avalable model: MLP,SVM,RandomForest,XGBoost
-
-# Example experiment modes:
-# prediction_feature_mode=baseline_snp
-# prediction_feature_mode=prs_only
-# prediction_feature_mode=snp_plus_prs
-#
-# Example DeepVariant GPU:
-# deepvariant_mode=gpu
-# deepvariant_docker_mode=true
-# gpu_devices=0
-#
-# Example auto mode with CPU fallback:
-# deepvariant_mode=auto
-# deepvariant_docker_mode=true
 
 # Evaluation
 # Toggle labeling for boxplot outliers/medians (Kraken + mapping). Accepts true/false/0/1/no/off.

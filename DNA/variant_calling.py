@@ -59,7 +59,6 @@ class VariantCalling:
         self.gpu_devices = str(getattr(args, 'gpu_devices', '0') or '0').strip()
         self.step3_max_concurrent_samples = max(1, int(getattr(args, 'step3_max_concurrent_samples', 1) or 1))
         self.step3_gpu_jobs = max(1, int(getattr(args, 'step3_gpu_jobs', 1) or 1))
-        self.step3_cpu_jobs = max(1, int(getattr(args, 'step3_cpu_jobs', 1) or 1))
         self.deepvariant_num_shards = max(1, int(getattr(args, 'deepvariant_num_shards', self.threads) or self.threads))
         self._deepvariant_use_gpu_supported = None
         self._deepvariant_backend = None
@@ -393,6 +392,11 @@ class VariantCalling:
 
     # ---------------- full pipeline ----------------
 
+    def _auto_step3_cpu_jobs(self, sample_count: int) -> int:
+        per_sample_cpu = max(1, self.deepvariant_num_shards)
+        jobs_by_cpu_budget = max(1, self.threads // per_sample_cpu)
+        return max(1, min(sample_count, self.step3_max_concurrent_samples, jobs_by_cpu_budget))
+
     def run_all(self) -> None:
         bams = self._discover_bams(self.align_outdir)
         if self.skip_samples:
@@ -404,7 +408,7 @@ class VariantCalling:
         if 'gpu' in backend:
             deepvariant_workers = min(len(bams), self.step3_max_concurrent_samples, self.step3_gpu_jobs)
         else:
-            deepvariant_workers = min(len(bams), self.step3_max_concurrent_samples, self.step3_cpu_jobs)
+            deepvariant_workers = self._auto_step3_cpu_jobs(len(bams))
         deepvariant_workers = max(1, deepvariant_workers)
         time_stamp(
             f"[deepvariant] Running {len(bams)} sample(s) with backend={backend}, "

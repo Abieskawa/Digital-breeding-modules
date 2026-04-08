@@ -57,7 +57,7 @@ class SNP_numerical:
             ensure_dir=True,
         )
 
-        self.top_n_snps_list = parse_int_list(self.config.get('top_n_snps_list', '10'))
+        self.top_n_snps_list = parse_int_list(self.config.get('top_n_snps_list', ''))
         self.prediction_feature_mode = (
             self.config.get('prediction_feature_mode', 'baseline_snp') or 'baseline_snp'
         ).strip().lower()
@@ -67,7 +67,7 @@ class SNP_numerical:
         # GWAS PC list (can be independent from PCA extraction count)
         self.gwas_n_pcs_list = parse_int_list(self.config.get('gwas_n_pcs_list', '')) or \
                               parse_int_list(self.config.get('gwas_n_pcs', '')) or \
-                              parse_int_list(self.config.get('n_pcs_list', '0'))
+                              parse_int_list(self.config.get('n_pcs_list', ''))
 
     def _load_prs_features(self, file_fold_npc_index: str, split: str) -> pd.DataFrame:
         prs_path = os.path.join(self.prs_output_dir, file_fold_npc_index, f"prs_scores_{file_fold_npc_index}.csv")

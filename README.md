@@ -34,6 +34,15 @@ micromamba create -n DGbreeding-ml -f ml.yml
 
 If you use conda instead of micromamba, replace `micromamba` with `conda`.
 
+Container builds:
+
+```bash
+docker build -f Dockerfile.gpu -t dgbreeding-gpu:test .
+docker build -f Dockerfile.cpu -t dgbreeding-cpu:test .
+```
+
+You do not need a separate pipeline code path for these two images. The code runs the bundled `/opt/deepvariant/bin/run_deepvariant` inside the image you built; the only operational difference is that the GPU image should be launched with Docker GPU access, for example `docker run --gpus device=0 ... dgbreeding-gpu:test`.
+
 
 ## Illustration of concept below steps 
 Run the pipeline via:
@@ -96,10 +105,6 @@ Minimal DeepVariant backend/resource keys:
 
 ```ini
 deepvariant_mode=auto
-deepvariant_docker_mode=true
-deepvariant_gpu_image=google/deepvariant:1.10.0-gpu
-deepvariant_cpu_image=google/deepvariant:1.10.0-beta
-gpu_devices=0
 step3_max_concurrent_samples=1
 step3_gpu_jobs=1
 step3_cpu_jobs=1
@@ -134,12 +139,10 @@ top_n_snps_list=10,50
 prs_top_n_snps_list=1-10,11-20,21-50
 ```
 
-DeepVariant GPU via Docker:
+DeepVariant GPU container:
 
 ```ini
 deepvariant_mode=gpu
-deepvariant_docker_mode=true
-gpu_devices=0
 step3_gpu_jobs=1
 deepvariant_num_shards=96
 ```
@@ -148,8 +151,6 @@ Auto mode with clean CPU fallback:
 
 ```ini
 deepvariant_mode=auto
-deepvariant_docker_mode=true
-deepvariant_cpu_image=google/deepvariant:1.10.0-beta
 step3_cpu_jobs=1
 ```
 

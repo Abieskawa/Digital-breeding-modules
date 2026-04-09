@@ -13,10 +13,6 @@ population=Streptococcus_resistance_population # For Readgroup/Circos naming (e.
 cpus=160
 mem=32G
 deepvariant_mode=gpu
-deepvariant_docker_mode=true
-deepvariant_gpu_image=google/deepvariant:1.10.0-gpu
-deepvariant_cpu_image=google/deepvariant:1.10.0
-gpu_devices=0  # GPU device IDs to expose to DeepVariant, e.g. 0 or 0,1
 
 # Step 1: Preprocessing DNA-seq (fastp)
 fastp_quality=20
@@ -54,10 +50,11 @@ bed_require_genes=true   # set true for gene-only (requires gff=...)
 hwe_p=1e-5
 geno_missing=0.10
 
-# LD pruning is currently always kept on by the pipeline.
+# Set ld_prune=true to enable LD pruning. Leave blank or comment it out to skip LD pruning.
 ld_prune=true
 # ld_method=indep-pairwise or indep
 # LD-pruning parameters
+# Only used when ld_prune=true
 ld_method=indep
 ld_window=50
 ld_step=5

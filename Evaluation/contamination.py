@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import re
 import subprocess as sbp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -19,6 +20,82 @@ from Utils.utils import (
     time_stamp,
 )
 from Evaluation.mapping_base import MappingEvalBase
+
+
+def _normalize_species_hint(raw: Optional[str]) -> str:
+    if not raw:
+        return ""
+    return " ".join(str(raw).replace("_", " ").split()).strip().lower()
+
+
+def _resolve_kraken_db_path(raw_db: str) -> Path:
+    raw_db = str(raw_db or "").strip()
+    if not raw_db:
+        return Path("")
+
+    candidates = [Path(raw_db).expanduser()]
+    raw_path = Path(raw_db)
+    if not raw_path.is_absolute():
+        candidates.append(Path("/") / raw_db)
+
+    seen = set()
+    for cand in candidates:
+        cand_str = str(cand)
+        if cand_str in seen:
+            continue
+        seen.add(cand_str)
+        if cand.exists():
+            return cand.resolve()
+    return candidates[0].resolve(strict=False)
+
+
+def _build_non_target_summaries(
+    species_df: pd.DataFrame,
+    target_species: Optional[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if species_df is None or species_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    work = species_df.copy()
+    work["name_norm"] = (
+        work["name"]
+        .astype(str)
+        .str.lower()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    target_norm = _normalize_species_hint(target_species)
+    if target_norm:
+        work = work[~work["name_norm"].str.contains(re.escape(target_norm), regex=True, na=False)]
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    per_sample = (
+        work.sort_values(["sample", "name_freq_pct", "n_records"], ascending=[True, False, False])
+        .groupby("sample", as_index=False)
+        .first()
+        .rename(
+            columns={
+                "name": "top_non_target_species",
+                "name_freq_pct": "top_non_target_pct",
+                "n_records": "top_non_target_records",
+            }
+        )
+    )
+    per_sample = per_sample[
+        ["sample", "top_non_target_species", "top_non_target_pct", "top_non_target_records", "total_records"]
+    ]
+
+    cohort = (
+        work.groupby("name", as_index=False)
+        .agg(
+            median_freq_pct=("name_freq_pct", "median"),
+            max_freq_pct=("name_freq_pct", "max"),
+            samples_detected=("sample", "nunique"),
+        )
+        .sort_values(["median_freq_pct", "max_freq_pct", "samples_detected"], ascending=[False, False, False])
+    )
+    return per_sample, cohort
 
 
 def _run_kraken2(
@@ -168,7 +245,7 @@ class ContaminationEvaluator(MappingEvalBase):
             return None
 
         log_dir = self.report_dir / "logs"
-        db_path = Path(self.kraken_db).expanduser()
+        db_path = _resolve_kraken_db_path(self.kraken_db)
         if not db_path.exists():
             msg = f"[contam] kraken_db path does not exist: {db_path}"
             time_stamp(msg)
@@ -316,5 +393,26 @@ class ContaminationEvaluator(MappingEvalBase):
         out_tsv = out_dir / "kraken_species_tidy.tsv"
         big.to_csv(out_tsv, sep="\t", index=False)
         time_stamp(f"[contam] wrote {out_tsv}")
+
+        sample_summary, cohort_summary = _build_non_target_summaries(big, self.species_name)
+        if not sample_summary.empty:
+            sample_summary_path = out_dir / "kraken_non_target_top_hits.tsv"
+            sample_summary.to_csv(sample_summary_path, sep="\t", index=False)
+            time_stamp(f"[contam] wrote {sample_summary_path}")
+        else:
+            time_stamp("[contam] no non-target species summary rows after applying target-species hint")
+
+        if not cohort_summary.empty:
+            cohort_summary_path = out_dir / "kraken_non_target_median_summary.tsv"
+            cohort_summary.to_csv(cohort_summary_path, sep="\t", index=False)
+            time_stamp(f"[contam] wrote {cohort_summary_path}")
+            hint_label = _normalize_species_hint(self.species_name) or "none"
+            time_stamp(f"[contam] target-species hint: {hint_label}")
+            for row in cohort_summary.head(5).itertuples(index=False):
+                time_stamp(
+                    "[contam] top non-target median: "
+                    f"{row.name} median={row.median_freq_pct:.3f}% "
+                    f"max={row.max_freq_pct:.3f}% samples={int(row.samples_detected)}"
+                )
 
         return big

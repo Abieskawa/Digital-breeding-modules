@@ -27,5 +27,7 @@ class MappingEvalBase:
         else:
             self.tag_outliers = bool(raw_tag)
 
-        self.kraken_db = DEFAULT_KRAKEN_DB
+        raw_kraken_db = str(getattr(args, "kraken_db", "") or "").strip()
+        self.kraken_db = raw_kraken_db or DEFAULT_KRAKEN_DB
+        self.species_name = str(getattr(args, "species_name", "") or "").strip() or None
         # report_dir already created by setup_eval_env

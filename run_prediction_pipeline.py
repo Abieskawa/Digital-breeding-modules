@@ -436,16 +436,17 @@ class PredictionPipeline(object):
         self.deepvariant_mode = raw_deepvariant_mode or ("gpu" if self.deepvariant_use_gpu else "cpu")
         if self.deepvariant_mode not in {"cpu", "gpu", "auto"}:
             raise ValueError(f"Unsupported deepvariant_mode: {self.deepvariant_mode}")
-        self.deepvariant_docker_mode = coerce_bool(configure.get("deepvariant_docker_mode", ""), False)
-        self.deepvariant_gpu_image = (
-            configure.get("deepvariant_gpu_image", "google/deepvariant:1.10.0-gpu")
-            or "google/deepvariant:1.10.0-gpu"
-        ).strip()
-        self.deepvariant_cpu_image = (
-            configure.get("deepvariant_cpu_image", "google/deepvariant:1.10.0")
-            or "google/deepvariant:1.10.0"
-        ).strip()
-        self.gpu_devices = (configure.get("gpu_devices", "0") or "0").strip()
+        for stale_key in (
+            "deepvariant_docker_mode",
+            "deepvariant_gpu_image",
+            "deepvariant_cpu_image",
+            "gpu_devices",
+        ):
+            stale_val = (configure.get(stale_key, "") or "").strip()
+            if stale_val:
+                time_stamp(
+                    f"[config] {stale_key} is ignored; the pipeline uses the bundled DeepVariant binary in the current container."
+                )
         self.step3_max_concurrent_samples = max(
             1,
             _coerce_int("step3_max_concurrent_samples", configure.get("step3_max_concurrent_samples", ""), 1),
@@ -468,11 +469,7 @@ class PredictionPipeline(object):
         self.hwe_p = configure.get("hwe_p", "1e-5")
         self.geno_missing = configure.get("geno_missing", "0.10")
         ld_prune_raw = configure.get("ld_prune", "")
-        if ld_prune_raw == "":
-            ld_prune_raw = configure.get("ld_pruning", "")
-        if ld_prune_raw and not coerce_bool(ld_prune_raw, True):
-            time_stamp("[config] ld_prune disabled; forcing LD pruning on.")
-        self.enable_ld_pruning = True
+        self.enable_ld_pruning = coerce_bool(ld_prune_raw, False)
         ld_method_raw = (configure.get("ld_method", "") or "").strip()
         self.ld_method = ld_method_raw or "indep"  # or indep-pairwise
         self.ld_window = _coerce_int("ld_window", configure.get("ld_window", ""), 50)
@@ -485,6 +482,8 @@ class PredictionPipeline(object):
         self.gff_biotype = configure.get("gff_biotype", "protein_coding")
         self.circos_window = _coerce_int("circos_window", configure.get("circos_window", ""), 10000)  # in bp
         self.circos_tick_step = _coerce_int("circos_tick_step", configure.get("circos_tick_step", ""), 0) or None
+        self.kraken_db = (configure.get("kraken_db", "") or "").strip() or None
+        self.species_name = (configure.get("species_name", "") or "").strip() or None
         tag_outliers_raw = (configure.get("tag_outliers", "true") or "true").strip().lower()
         self.tag_outliers = tag_outliers_raw not in {"0", "false", "no", "off"}
         # --- Prediction / CV knobs (used in step 4/5/6 CV orchestration) ---

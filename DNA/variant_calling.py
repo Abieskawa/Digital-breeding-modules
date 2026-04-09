@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # DNA/variant_calling.py
 
+import os
 import shutil
 import shlex
 import subprocess as sbp
@@ -14,7 +15,7 @@ from Utils.utils import run_quiet, time_stamp, coerce_bool
 class VariantCalling:
     """
     Steps:
-      1) DeepVariant (Docker) per-sample → per-sample VCF + gVCF
+      1) DeepVariant (local binary inside the current container) per-sample → per-sample VCF + gVCF
       2) GLnexus joint-call → cohort.merged.vcf.gz (+.tbi)
       3) plink2 QC (+MAF) → cohort.filtered.vcf.gz (+.tbi)
       4) plink2 LD-prune → cohort.filtered.ldpruned.vcf.gz (+.tbi)
@@ -49,18 +50,9 @@ class VariantCalling:
         self.deepvariant_mode = raw_mode or ('gpu' if self.deepvariant_use_gpu else 'cpu')
         if self.deepvariant_mode not in {'cpu', 'gpu', 'auto'}:
             raise ValueError(f"Unsupported deepvariant_mode: {self.deepvariant_mode}")
-        self.deepvariant_docker_mode = coerce_bool(getattr(args, 'deepvariant_docker_mode', None), False)
-        self.deepvariant_gpu_image = str(
-            getattr(args, 'deepvariant_gpu_image', 'google/deepvariant:1.10.0-gpu') or 'google/deepvariant:1.10.0-gpu'
-        ).strip()
-        self.deepvariant_cpu_image = str(
-            getattr(args, 'deepvariant_cpu_image', 'google/deepvariant:1.10.0-beta') or 'google/deepvariant:1.10.0-beta'
-        ).strip()
-        self.gpu_devices = str(getattr(args, 'gpu_devices', '0') or '0').strip()
         self.step3_max_concurrent_samples = max(1, int(getattr(args, 'step3_max_concurrent_samples', 1) or 1))
         self.step3_gpu_jobs = max(1, int(getattr(args, 'step3_gpu_jobs', 1) or 1))
         self.deepvariant_num_shards = max(1, int(getattr(args, 'deepvariant_num_shards', self.threads) or self.threads))
-        self._deepvariant_use_gpu_supported = None
         self._deepvariant_backend = None
         self.model_type        = 'WGS'
         self.deepvariant_extra_args = str(getattr(args, 'deepvariant_extra_args', '') or '').strip()
@@ -78,14 +70,8 @@ class VariantCalling:
             time_stamp(f"[variant] Invalid maf={self.maf}; using default 0.05")
             self.maf = 0.05
 
-        ld_prune_raw = getattr(args, 'enable_ld_pruning', None)
-        if ld_prune_raw is None:
-            ld_prune_raw = getattr(args, 'ld_prune', None)
-        if ld_prune_raw is None:
-            ld_prune_raw = getattr(args, 'ld_pruning', None)
-        if ld_prune_raw is not None and not coerce_bool(ld_prune_raw, True):
-            time_stamp("[variant] LD pruning disabled in config; forcing enabled.")
-        self.enable_ld_pruning = True
+        ld_prune_raw = getattr(args, 'ld_prune', None)
+        self.enable_ld_pruning = coerce_bool(ld_prune_raw, False)
 
         self.ld_method = str(getattr(args, 'ld_method', 'indep'))
         self.ld_window = int(getattr(args, 'ld_window', 50))
@@ -109,111 +95,40 @@ class VariantCalling:
         gz_vcf = raw_vcf.with_suffix('.vcf.gz')
         return raw_vcf, gz_vcf
 
-    def _deepvariant_supports_use_gpu(self, deepvariant_cmd: str) -> bool:
-        if self._deepvariant_use_gpu_supported is not None:
-            return self._deepvariant_use_gpu_supported
-        help_cmd = f"{deepvariant_cmd} --help"
-        try:
-            out = sbp.check_output(help_cmd, shell=True, text=True, stderr=sbp.STDOUT)
-        except Exception as exc:
-            time_stamp(f"[deepvariant] unable to verify --use_gpu support ({exc}); running without GPU flag.")
-            self._deepvariant_use_gpu_supported = False
-            return False
-        self._deepvariant_use_gpu_supported = "--use_gpu" in out
-        if not self._deepvariant_use_gpu_supported:
-            time_stamp("[deepvariant] --use_gpu not supported by this DeepVariant build; running without GPU flag.")
-        return self._deepvariant_use_gpu_supported
+    @staticmethod
+    def _local_deepvariant_path() -> Path:
+        return Path("/opt/deepvariant/bin/run_deepvariant")
 
     def _local_deepvariant_bin(self) -> str:
         jemalloc_path = Path("/usr/lib/x86_64-linux-gnu/libjemalloc.so.2")
-        deepvariant_bin = "/opt/deepvariant/bin/run_deepvariant"
+        deepvariant_bin = str(self._local_deepvariant_path())
         if jemalloc_path.exists():
             deepvariant_bin = f"LD_PRELOAD={jemalloc_path} {deepvariant_bin}"
         return deepvariant_bin
 
-    @staticmethod
-    def _probe_command(cmd: str) -> bool:
-        try:
-            sbp.run(
-                cmd,
-                shell=True,
-                check=True,
-                stdout=sbp.DEVNULL,
-                stderr=sbp.DEVNULL,
-            )
-            return True
-        except Exception:
-            return False
-
-    def _probe_docker_backend(self, use_gpu: bool) -> bool:
-        if not self.deepvariant_docker_mode or shutil.which("docker") is None:
-            return False
-        gpus_arg = f"--gpus device={shlex.quote(self.gpu_devices)} " if use_gpu else ""
-        image = self.deepvariant_gpu_image if use_gpu else self.deepvariant_cpu_image
-        cmd = (
-            f"docker run --rm {gpus_arg}{shlex.quote(image)} "
-            "/opt/deepvariant/bin/run_deepvariant --help"
-        )
-        return self._probe_command(cmd)
-
-    def _probe_local_backend(self, use_gpu: bool) -> bool:
-        deepvariant_bin = self._local_deepvariant_bin()
-        if use_gpu:
-            return self._deepvariant_supports_use_gpu(deepvariant_bin)
-        return self._probe_command(f"{deepvariant_bin} --help")
+    def _local_deepvariant_available(self) -> bool:
+        deepvariant_path = self._local_deepvariant_path()
+        return deepvariant_path.exists() and os.access(deepvariant_path, os.X_OK)
 
     def _select_deepvariant_backend(self) -> str:
         if self._deepvariant_backend is not None:
             return self._deepvariant_backend
 
-        if self.deepvariant_mode == 'cpu':
-            candidates = ['docker_cpu', 'local_cpu'] if self.deepvariant_docker_mode else ['local_cpu']
-        elif self.deepvariant_mode == 'gpu':
-            candidates = ['docker_gpu', 'local_gpu', 'docker_cpu', 'local_cpu'] if self.deepvariant_docker_mode else ['local_gpu', 'local_cpu']
+        if not self._local_deepvariant_available():
+            raise RuntimeError(
+                f"Local DeepVariant binary not found or not executable: {self._local_deepvariant_path()}"
+            )
+
+        if self.deepvariant_mode == 'gpu':
+            self._deepvariant_backend = 'local_gpu'
         else:
-            candidates = ['docker_gpu', 'local_gpu', 'docker_cpu', 'local_cpu'] if self.deepvariant_docker_mode else ['local_gpu', 'local_cpu']
-
-        for backend in candidates:
-            if backend == 'docker_gpu' and self._probe_docker_backend(True):
-                self._deepvariant_backend = backend
-                break
-            if backend == 'docker_cpu' and self._probe_docker_backend(False):
-                self._deepvariant_backend = backend
-                break
-            if backend == 'local_gpu' and self._probe_local_backend(True):
-                self._deepvariant_backend = backend
-                break
-            if backend == 'local_cpu' and self._probe_local_backend(False):
-                self._deepvariant_backend = backend
-                break
-
-        if self._deepvariant_backend is None:
-            raise RuntimeError("No usable DeepVariant backend was found (checked Docker/local CPU/GPU paths).")
+            self._deepvariant_backend = 'local_cpu'
 
         time_stamp(
             f"[deepvariant] Selected backend={self._deepvariant_backend} "
-            f"(mode={self.deepvariant_mode}, docker_mode={self.deepvariant_docker_mode})"
+            f"(mode={self.deepvariant_mode})"
         )
         return self._deepvariant_backend
-
-    def _docker_mounts(self, bam_path: Path) -> str:
-        mounts = [
-            (self.ref_fasta.parent.resolve(), "ro"),
-            (bam_path.parent.resolve(), "ro"),
-            (self.variant_outdir.resolve(), "rw"),
-        ]
-        if self.capture_bed:
-            mounts.append((self.capture_bed.parent.resolve(), "ro"))
-
-        seen = set()
-        parts = []
-        for path, mode in mounts:
-            key = (str(path), mode)
-            if key in seen:
-                continue
-            seen.add(key)
-            parts.append(f"-v {shlex.quote(f'{path}:{path}:{mode}')}")
-        return " ".join(parts)
 
     def _build_deepvariant_cmd(self, sample: str, bam_path: Path, backend: str) -> Tuple[str, Path, Path]:
         v_out = self.variant_outdir / '{0}.vcf.gz'.format(sample)
@@ -232,30 +147,9 @@ class VariantCalling:
             f"--num_shards={self.deepvariant_num_shards}"
         )
 
-        if backend == 'docker_gpu':
-            cmd = (
-                f"docker run --rm --gpus device={shlex.quote(self.gpu_devices)} "
-                f"{self._docker_mounts(bam_path)} "
-                f"{shlex.quote(self.deepvariant_gpu_image)} "
-                f"/opt/deepvariant/bin/run_deepvariant {common_args}"
-            )
-            return cmd, v_out, g_out
-
-        if backend == 'docker_cpu':
-            cmd = (
-                f"docker run --rm "
-                f"{self._docker_mounts(bam_path)} "
-                f"{shlex.quote(self.deepvariant_cpu_image)} "
-                f"/opt/deepvariant/bin/run_deepvariant {common_args}"
-            )
-            return cmd, v_out, g_out
-
         env_prefix = "TF_CPP_MIN_LOG_LEVEL=2 PYTHONWARNINGS=ignore"
-        gpu_arg = ""
         deepvariant_bin = self._local_deepvariant_bin()
-        if backend == 'local_gpu' and self._deepvariant_supports_use_gpu(deepvariant_bin):
-            gpu_arg = "--use_gpu "
-        cmd = f"{env_prefix} {deepvariant_bin} {gpu_arg}{common_args}"
+        cmd = f"{env_prefix} {deepvariant_bin} {common_args}"
         return cmd, v_out, g_out
 
     # ---------------- DeepVariant (per sample) ----------------
@@ -426,5 +320,8 @@ class VariantCalling:
 
         merged   = self.joint_call_glnexus()
         filtered = self.plink_qc(merged, out_prefix='cohort.filtered')
-        _pruned  = self.ld_prune(filtered, out_prefix='cohort.filtered.ldpruned')
+        if self.enable_ld_pruning:
+            _pruned = self.ld_prune(filtered, out_prefix='cohort.filtered.ldpruned')
+        else:
+            time_stamp("[variant] LD pruning disabled; skipping cohort.filtered.ldpruned.vcf.gz export.")
         _archive = self.pigz_archive_bams()

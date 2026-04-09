@@ -1,0 +1,114 @@
+# syntax=docker/dockerfile:1
+
+# ==========================
+# Stage 1: build conda envs
+# ==========================
+FROM mambaorg/micromamba:1.5.8 AS envbuilder
+
+USER root
+SHELL ["/bin/bash", "-lc"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+USER mambauser
+
+RUN cat > /tmp/biotools.yml <<'YAML'
+name: DGbreeding-biotools
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+channel_priority: strict
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - matplotlib-base
+  - seaborn
+  - fastp=1.1.0
+  - bwa-mem2
+  - samtools
+  - bcftools=1.22
+  - htslib=1.22
+  - glnexus=1.4.1
+  - plink2
+  - pigz
+  - coreutils
+  - tqdm
+  - fastqc
+  - multiqc
+  - kraken2
+  - pycirclize
+  - adjusttext
+YAML
+
+RUN micromamba create -y -n DGbreeding-biotools -f /tmp/biotools.yml \
+    && micromamba clean -a -y
+
+RUN cat > /tmp/ml.yml <<'YAML'
+name: DGbreeding-ml
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+channel_priority: strict
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.23.5
+  - pandas=1.5.3
+  - scikit-learn=1.3.*
+  - xgboost=1.7.*
+  - shap=0.41.0
+  - numba=0.56.4
+  - matplotlib=3.8.*
+  - seaborn=0.12.*
+  - tqdm
+  - pycirclize
+  - imbalanced-learn
+  - pytorch
+  - cpuonly
+  - adjusttext
+  - ipython
+  - pip:
+      - qmplot
+YAML
+
+RUN micromamba create -y -n DGbreeding-ml -f /tmp/ml.yml \
+    && micromamba clean -a -y
+
+
+# ==========================
+# Stage 2: runtime
+# ==========================
+FROM google/deepvariant:1.10.0 AS runtime
+SHELL ["/bin/bash", "-lc"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates bash bzip2 tar pigz coreutils tzdata libjemalloc2 \
+    && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+    && dpkg-reconfigure -f noninteractive tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=envbuilder /opt/conda /opt/conda
+
+WORKDIR /opt/dgbreeding
+COPY . /opt/dgbreeding/
+
+RUN mkdir -p /home/abieskawa/tools/blink \
+    && ln -sf /opt/dgbreeding/BLINK/blink_linux /home/abieskawa/tools/blink/blink1_5
+
+ENV PATH="/opt/conda/envs/DGbreeding-ml/bin:/opt/conda/envs/DGbreeding-biotools/bin:/opt/deepvariant/bin:${PATH}" \
+    PYTHONUNBUFFERED=1
+
+RUN mkdir -p /data
+WORKDIR /data
+
+ENTRYPOINT ["/opt/conda/envs/DGbreeding-ml/bin/python", "/opt/dgbreeding/run_prediction_pipeline.py"]
